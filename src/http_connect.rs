@@ -5,11 +5,14 @@ use n0_snafu::{Result, ResultExt};
 use quinn::{RecvStream, SendStream};
 use snafu::{FromString, whatever};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::AuthError;
 use crate::quinn_util::forward_bidi;
 
 // how much data to read for the CONNECT handshake before it's considered invalid
@@ -21,6 +24,24 @@ const IROH_DESTINATION_HEADER: &str = "Iroh-Destination";
 pub const IROH_HTTP_CONNECT_ALPN: &[u8] = b"h2";
 
 const STREAM_OPEN_HANDSHAKE: &[u8] = b"OPEN";
+
+pub trait AuthHandler: Send + Sync {
+    fn authorize<'a>(
+        &'a self,
+        req: &'a Request,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>>;
+}
+
+pub struct NoAuthHandler;
+
+impl AuthHandler for NoAuthHandler {
+    fn authorize<'a>(
+        &'a self,
+        _req: &'a Request,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
 
 #[derive(Debug)]
 pub struct HttpConnectEntranceHandle {
@@ -117,7 +138,8 @@ impl HttpConnectEntranceHandle {
                                 // .map_err(anyhow::Error::into_boxed_dyn_error)?;
                             }
                             None => {
-                                todo!("Implement local proxy functionality");
+                                // todo!("Implement local proxy functionality");
+                                //
                                 // // no iroh header present, just do a local proxy. Useless? Maybe?
                                 // // might be helpful if the listening address is outside-dialable.
                                 // // regardless, it's more compliant with the notion of a normal
@@ -175,7 +197,10 @@ pub struct HttpConnectListenerHandle {
 }
 
 impl HttpConnectListenerHandle {
-    pub async fn listen(endpoint: Endpoint) -> Result<Self> {
+    pub async fn listen(
+        endpoint: Endpoint,
+        auth: Option<Arc<Box<dyn AuthHandler>>>,
+    ) -> Result<Self> {
         tracing::info!(endpoint_id = %endpoint.addr().id.fmt_short(), "listening for HTTP CONNECT requests over iroh");
 
         let endpoint_2 = endpoint.clone();
@@ -196,8 +221,9 @@ impl HttpConnectListenerHandle {
                 let Ok(connecting) = incoming.accept() else {
                     break;
                 };
+                let auth = auth.clone();
                 tokio::spawn(async move {
-                    if let Err(cause) = Self::handle_endpoint_accept(connecting).await {
+                    if let Err(cause) = Self::handle_endpoint_accept(connecting, auth).await {
                         tracing::warn!("error handling connection: {}", cause);
                     }
                 });
@@ -212,7 +238,10 @@ impl HttpConnectListenerHandle {
     }
 
     // handle a new incoming connection on the endpoint
-    async fn handle_endpoint_accept(connecting: Connecting) -> Result<()> {
+    async fn handle_endpoint_accept(
+        connecting: Connecting,
+        auth: Option<Arc<Box<dyn AuthHandler>>>,
+    ) -> Result<()> {
         let connection = connecting.await.context("error accepting connection")?;
         let remote_node_id = &connection.remote_id()?;
         tracing::info!(remote_node_id = %remote_node_id.fmt_short(), "got connection");
@@ -228,6 +257,14 @@ impl HttpConnectListenerHandle {
         r.read(&mut buffer).await.context("reading handshake")?;
         let req = Request::parse(&buffer)?;
         tracing::warn!(req = ?req, "read handshake");
+
+        if let Some(handler) = auth {
+            // TODO - make errors real
+            handler
+                .authorize(&req)
+                .await
+                .map_err(|_| n0_snafu::Error::without_source("unauthorized".to_string()))?;
+        }
 
         match req {
             Request::Connect(req) => Self::handle_connect_request(connection, s, req).await,
@@ -310,13 +347,13 @@ impl HttpConnectListenerHandle {
 // pub async fn listen_http_connect(endpoint: Endpoint) -> Result<HttpConnectListenerHandle> {}
 
 #[derive(Debug)]
-enum Request {
+pub enum Request {
     Connect(ProxyConnectRequest),
     Http(ProxyHttpRequest),
 }
 
 #[derive(Debug)]
-struct ProxyConnectRequest {
+pub struct ProxyConnectRequest {
     host: String,
     port: u16,
     endpoint_addr: Option<EndpointAddr>,
@@ -333,7 +370,7 @@ impl ProxyConnectRequest {
 }
 
 #[derive(Debug)]
-struct ProxyHttpRequest {
+pub struct ProxyHttpRequest {
     method: String,
     path: String,
     endpoint_addr: Option<EndpointAddr>,
