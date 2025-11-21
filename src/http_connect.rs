@@ -15,31 +15,33 @@ use tokio_util::sync::CancellationToken;
 use crate::error::AuthError;
 use crate::quinn_util::forward_bidi;
 
-// how much data to read for the CONNECT handshake before it's considered invalid
-// 8KB should be plenty.
+/// how much data to read for the CONNECT handshake before it's considered invalid
+/// 8KB should be plenty.
 const CONNECT_HANDSHAKE_MAX_LENGTH: usize = 8192;
-// HTTP header for iroh addressing info
+/// HTTP header for iroh addressing info
 const IROH_DESTINATION_HEADER: &str = "Iroh-Destination";
+/// The ALPN that we're using for iroh connections, defaults to HTTP/2
 // TODO - do we use HTTP/3 here? this ALPN is only ever used over iroh
 pub const IROH_HTTP_CONNECT_ALPN: &[u8] = b"h2";
-
+/// Handshake to distinguish a stream construction
 const STREAM_OPEN_HANDSHAKE: &[u8] = b"OPEN";
 
 pub trait AuthHandler: Send + Sync {
     fn authorize<'a>(
         &'a self,
         req: &'a Request,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>>;
 }
 
+/// NoAuthHandler rejects all requests
 pub struct NoAuthHandler;
 
 impl AuthHandler for NoAuthHandler {
     fn authorize<'a>(
         &'a self,
         _req: &'a Request,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>> {
-        Box::pin(async move { Ok(()) })
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>> {
+        Box::pin(async move { Ok(false) })
     }
 }
 
@@ -343,9 +345,6 @@ impl HttpConnectListenerHandle {
     }
 }
 
-// /// Listen on an endpoint and forward incoming HTTP CONNECT connections to a a local tcp socket.
-// pub async fn listen_http_connect(endpoint: Endpoint) -> Result<HttpConnectListenerHandle> {}
-
 #[derive(Debug)]
 pub enum Request {
     Connect(ProxyConnectRequest),
@@ -377,7 +376,7 @@ pub struct ProxyHttpRequest {
 }
 
 impl Request {
-    fn parse(buffer: &[u8]) -> Result<Self> {
+    pub fn parse(buffer: &[u8]) -> Result<Self> {
         let mut headers = [Header {
             name: IROH_DESTINATION_HEADER,
             value: b"",
@@ -540,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_method() {
-        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let request = b"BANANA / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert!(Request::parse(request).is_err());
     }
 
