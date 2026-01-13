@@ -1,12 +1,9 @@
 use std::str::FromStr;
 
 use bytes::{Bytes, BytesMut};
-use http::{HeaderValue, uri::Scheme};
-use iroh::EndpointId;
+use http::{HeaderValue, StatusCode, uri::Scheme};
 use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::io::{self, AsyncRead, AsyncReadExt};
-
-use crate::http_connect::IROH_DESTINATION_HEADER;
 
 #[derive(Debug, Clone, derive_more::Display)]
 #[display("{host}:{port}")]
@@ -116,14 +113,6 @@ impl InitialData {
 }
 
 impl HttpRequest {
-    pub(crate) fn parse_destination_header(&self) -> Result<Option<EndpointId>> {
-        if let Some(s) = self.headers.get(IROH_DESTINATION_HEADER) {
-            Ok(Some(s.to_str().anyerr()?.parse()?))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn parse(buf: &[u8]) -> Result<Self> {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
@@ -204,5 +193,48 @@ impl HttpRequest {
             Some((name, value))
         }));
         Ok(Self { kind, headers })
+    }
+}
+
+#[derive(derive_more::Debug)]
+pub struct HttpResponse {
+    pub status: StatusCode,
+}
+
+impl HttpResponse {
+    pub async fn read(
+        reader: &mut (impl AsyncRead + Unpin),
+        max_len: usize,
+    ) -> Result<(InitialData, Self)> {
+        let mut buf = BytesMut::new();
+        while buf.len() < max_len {
+            let n = reader.read_buf(&mut buf).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "Header section longer than memory limit",
+                )
+                .into());
+            }
+
+            let mut headers = [httparse::EMPTY_HEADER; 0];
+            let mut res = httparse::Response::new(&mut headers);
+
+            match res
+                .parse(&buf[..])
+                .std_context("Failed to parse HTTP request")?
+            {
+                httparse::Status::Partial => continue,
+                httparse::Status::Complete(body_offset) => {
+                    let status = http::StatusCode::from_u16(res.code.unwrap_or(500))
+                        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                    let response = HttpResponse { status };
+                    let initial_data = InitialData::new(buf, body_offset);
+                    return Ok((initial_data, response));
+                }
+            }
+        }
+
+        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF").into())
     }
 }

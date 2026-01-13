@@ -1,20 +1,15 @@
-use std::{io, pin::Pin, sync::Arc, time::Duration};
+use std::{io, ops::Deref, pin::Pin, str::FromStr, sync::Arc};
 
-use http::StatusCode;
-use iroh::{Endpoint, EndpointId};
-use iroh_blobs::util::connection_pool::{self, ConnectionPool};
-use n0_error::{AnyError, StackResultExt, StdResultExt, anyerr};
+use iroh::EndpointId;
+use n0_error::AnyError;
+use n0_future::FutureExt;
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
+    net::{TcpListener, tcp::OwnedWriteHalf},
 };
 use tracing::{Instrument, debug, warn, warn_span};
 
-use crate::{
-    http_connect::{ALPN, CONNECT_HANDSHAKE_MAX_LENGTH},
-    parse::HttpRequest,
-    util::forward_bidi,
-};
+use crate::{IROH_DESTINATION_HEADER, PoolOptions, TunnelClientPool, parse::HttpRequest};
 
 pub trait ResolveDestination: Send + Sync + 'static {
     fn resolve_destination<'a>(
@@ -23,56 +18,63 @@ pub trait ResolveDestination: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Option<EndpointId>> + Send + 'a>>;
 }
 
-pub struct PoolOptions {
-    connect_timeout: Duration,
-    idle_timeout: Duration,
+pub struct ResolveDestinationFromHeader {
+    header_name: String,
 }
 
-impl Default for PoolOptions {
+impl Default for ResolveDestinationFromHeader {
     fn default() -> Self {
-        Self {
-            connect_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(5),
-        }
+        Self::new(IROH_DESTINATION_HEADER.to_string())
     }
 }
 
-impl From<PoolOptions> for connection_pool::Options {
-    fn from(opts: PoolOptions) -> Self {
-        connection_pool::Options {
-            connect_timeout: opts.connect_timeout,
-            idle_timeout: opts.idle_timeout,
-            ..Default::default()
+impl ResolveDestinationFromHeader {
+    pub fn new(header_name: String) -> Self {
+        Self { header_name }
+    }
+}
+
+impl ResolveDestination for ResolveDestinationFromHeader {
+    fn resolve_destination<'a>(
+        &'a self,
+        req: &'a HttpRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<EndpointId>> + Send + 'a>> {
+        async {
+            if let Some(value) = req.headers.get(&self.header_name) {
+                EndpointId::from_str(value.to_str().ok()?).ok()
+            } else {
+                None
+            }
         }
+        .boxed()
     }
 }
 
 pub struct ProxyOptions {
     pub pool: PoolOptions,
-    pub parse_destination: Option<Arc<dyn ResolveDestination>>,
+    pub parse_destination: Arc<dyn ResolveDestination>,
 }
 
 impl Default for ProxyOptions {
     fn default() -> Self {
         Self {
             pool: Default::default(),
-            parse_destination: None,
+            parse_destination: Arc::new(ResolveDestinationFromHeader::default()),
         }
     }
 }
 
 #[derive(Clone)]
-pub struct ProxyGateway {
-    pool: ConnectionPool,
-    parse_destination: Option<Arc<dyn ResolveDestination>>,
+pub struct GatewayListener {
+    pool: TunnelClientPool,
+    resolve_destination: Arc<dyn ResolveDestination>,
 }
 
-impl ProxyGateway {
-    pub fn new(endpoint: Endpoint, opts: ProxyOptions) -> Self {
-        let pool = ConnectionPool::new(endpoint, ALPN, opts.pool.into());
+impl GatewayListener {
+    pub fn new(pool: TunnelClientPool, resolve_destination: Arc<dyn ResolveDestination>) -> Self {
         Self {
             pool,
-            parse_destination: opts.parse_destination,
+            resolve_destination,
         }
     }
 
@@ -82,11 +84,15 @@ impl ProxyGateway {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     conn_id += 1;
-                    let gateway = self.clone();
+                    let this = self.clone();
                     tokio::spawn(
                         async move {
                             debug!("New connection from {}", peer_addr);
-                            match gateway.handle_connection(stream).await {
+                            match this
+                                .pool
+                                .forward_http_connection(stream, this.resolve_destination.deref())
+                                .await
+                            {
                                 Ok(()) => {
                                     debug!("connection closed");
                                 }
@@ -107,85 +113,6 @@ impl ProxyGateway {
             }
         }
     }
-
-    async fn resolve_destination(&self, request: &HttpRequest) -> n0_error::Result<EndpointId> {
-        match request.parse_destination_header()? {
-            Some(destination) => Ok(destination),
-            None => match self.parse_destination.as_ref() {
-                None => Err(anyerr!("No iroh destinatination found in request")),
-                Some(pd) => pd
-                    .resolve_destination(request)
-                    .await
-                    .context("Failed to resolve destination"),
-            },
-        }
-    }
-
-    pub async fn handle_connection(&self, conn: TcpStream) -> Result<(), ProxyFailure> {
-        let (mut tcp_recv, tcp_send) = conn.into_split();
-        let (initial_data, request) =
-            match HttpRequest::read(&mut tcp_recv, CONNECT_HANDSHAKE_MAX_LENGTH).await {
-                Ok(req) => req,
-                Err(err) => {
-                    return Err(ProxyFailure::new(
-                        tcp_send,
-                        StatusCode::BAD_REQUEST,
-                        err.into(),
-                    ));
-                }
-            };
-        let destination = match self.resolve_destination(&request).await {
-            Ok(destination) => destination,
-            Err(err) => {
-                let err = err.context("Failed to parse iroh destination from HTTP request");
-                return Err(ProxyFailure::new(tcp_send, StatusCode::BAD_REQUEST, err));
-            }
-        };
-
-        let conn = match self
-            .pool
-            .get_or_connect(destination)
-            .await
-            .std_context("Failed to connect to iroh destination endpoint")
-        {
-            Ok(conn) => conn,
-            Err(err) => {
-                return Err(ProxyFailure::new(
-                    tcp_send,
-                    StatusCode::GATEWAY_TIMEOUT,
-                    err,
-                ));
-            }
-        };
-
-        let (mut proxy_send, proxy_recv) = match conn
-            .open_bi()
-            .await
-            .std_context("Failed to open streams to iroh destination")
-        {
-            Ok(s) => s,
-            Err(err) => {
-                return Err(ProxyFailure::new(
-                    tcp_send,
-                    StatusCode::GATEWAY_TIMEOUT,
-                    err,
-                ));
-            }
-        };
-
-        if let Err(err) = proxy_send
-            .write_chunk(initial_data.full())
-            .await
-            .std_context("Failed to write initial data to proxy")
-        {
-            return Err(ProxyFailure::new(tcp_send, StatusCode::BAD_GATEWAY, err));
-        }
-
-        if let Err(err) = forward_bidi(tcp_recv, tcp_send, proxy_recv, proxy_send).await {
-            warn!("Forwarding to proxy streams closed with error: {err:#}");
-        }
-        Ok(())
-    }
 }
 
 pub struct ProxyFailure {
@@ -195,7 +122,7 @@ pub struct ProxyFailure {
 }
 
 impl ProxyFailure {
-    fn new(tcp_send: OwnedWriteHalf, status: http::StatusCode, source: AnyError) -> Self {
+    pub fn new(tcp_send: OwnedWriteHalf, status: http::StatusCode, source: AnyError) -> Self {
         Self {
             tcp_send,
             status,
@@ -235,24 +162,29 @@ impl ProxyFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use http::{HeaderMap, StatusCode};
     use iroh::{Endpoint, protocol::Router};
     use n0_error::{Result, StdResultExt};
     use n0_tracing_test::traced_test;
     use tokio::net::TcpListener;
 
-    use crate::{ALPN, AcceptAll, ProxyGateway, TunnelListener};
+    use crate::{
+        ALPN, AcceptAll, GatewayListener, ResolveDestinationFromHeader, TunnelClientPool,
+        TunnelListener,
+    };
 
     #[tokio::test]
     #[traced_test]
     async fn gw_reqwest_end_to_end() -> Result {
         let gw_ep = Endpoint::bind().await?;
         println!("gateway: {}", gw_ep.id());
-        let gw_state = ProxyGateway::new(gw_ep, Default::default());
-
+        let pool = TunnelClientPool::new(gw_ep, Default::default());
+        let gw = GatewayListener::new(pool, Arc::new(ResolveDestinationFromHeader::default()));
         let gw_listener = TcpListener::bind("localhost:0").await?;
         let gw_addr = gw_listener.local_addr()?;
-        let gw_task = tokio::spawn(async move { gw_state.listen(gw_listener).await });
+        let gw_task = tokio::spawn(async move { gw.listen(gw_listener).await });
 
         let upstream_router = {
             let ep = Endpoint::bind().await?;
