@@ -1,7 +1,20 @@
 use n0_error::{Result, StdResultExt};
 use std::io;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) async fn send_error_response(
+    writer: &mut (impl AsyncWrite + Unpin),
+    status: http::StatusCode,
+) -> Result<()> {
+    let status_line = format!(
+        "HTTP/1.1 {} {}\r\n\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
+    writer.write_all(status_line.as_bytes()).await?;
+    Ok(())
+}
 
 fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
     move |x| {
