@@ -22,7 +22,7 @@ use crate::{ProxyFailure, ResolveDestination};
 
 /// how much data to read for the CONNECT handshake before it's considered invalid
 /// 8KB should be plenty.
-pub(crate) const CONNECT_HANDSHAKE_MAX_LENGTH: usize = 8192;
+pub(crate) const HEADER_SECTION_MAX_LENGTH: usize = 8192;
 
 /// HTTP header for iroh addressing info
 pub const IROH_DESTINATION_HEADER: &str = "Iroh-Destination";
@@ -50,8 +50,7 @@ impl TunnelListener {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<()> {
-        let (initial_data, req) =
-            HttpRequest::read(&mut recv, CONNECT_HANDSHAKE_MAX_LENGTH).await?;
+        let (initial_data, req) = HttpRequest::read(&mut recv, HEADER_SECTION_MAX_LENGTH).await?;
 
         if let RequestKind::Http {
             authority_from_path,
@@ -100,20 +99,7 @@ impl TunnelListener {
                     .await
                     .anyerr()?;
 
-                let status_line = format!(
-                    "{:?} {} {}\r\n",
-                    res.version(),
-                    res.status().as_u16(),
-                    res.status().canonical_reason().unwrap_or_default()
-                );
-                send.write_all(status_line.as_bytes()).await.anyerr()?;
-                for (name, value) in res.headers() {
-                    send.write_all(name.as_str().as_bytes()).await.anyerr()?;
-                    send.write_all(b": ").await.anyerr()?;
-                    send.write_all(value.as_bytes()).await.anyerr()?;
-                    send.write_all(b"\r\n").await.anyerr()?;
-                }
-                send.write_all(b"\r\n").await.anyerr()?;
+                write_header_section(&res, &mut send).await?;
                 let mut body = res.bytes_stream();
                 while let Some(bytes) = body.next().await {
                     let bytes = bytes.anyerr()?;
@@ -216,12 +202,13 @@ impl TunnelClientPool {
                 {
                     warn!("Handling local connection closed with error: {err:#}")
                 } else {
-                    warn!("Connection closed")
+                    debug!("Connection closed")
                 }
             };
             tokio::spawn(
-                cancel_token.run_until_cancelled_owned(fut)
-                    .instrument(error_span!("forward-tcp", destination=%destination.fmt_short(), client=%client_addr))
+                cancel_token
+                    .run_until_cancelled_owned(fut)
+                    .instrument(error_span!("tcp-conn", client=%client_addr)),
             );
         }
     }
@@ -265,7 +252,7 @@ impl TunnelClientPool {
     ) -> Result<(), ProxyFailure> {
         let (mut tcp_recv, tcp_send) = conn.into_split();
         let (initial_data, request) =
-            match HttpRequest::read(&mut tcp_recv, CONNECT_HANDSHAKE_MAX_LENGTH).await {
+            match HttpRequest::read(&mut tcp_recv, HEADER_SECTION_MAX_LENGTH).await {
                 Ok(req) => req,
                 Err(err) => {
                     return Err(ProxyFailure::new(
@@ -332,4 +319,22 @@ impl From<PoolOptions> for connection_pool::Options {
             ..Default::default()
         }
     }
+}
+
+async fn write_header_section(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {
+    let status_line = format!(
+        "{:?} {} {}\r\n",
+        res.version(),
+        res.status().as_u16(),
+        res.status().canonical_reason().unwrap_or_default()
+    );
+    send.write_all(status_line.as_bytes()).await.anyerr()?;
+    for (name, value) in res.headers() {
+        send.write_all(name.as_str().as_bytes()).await.anyerr()?;
+        send.write_all(b": ").await.anyerr()?;
+        send.write_all(value.as_bytes()).await.anyerr()?;
+        send.write_all(b"\r\n").await.anyerr()?;
+    }
+    send.write_all(b"\r\n").await.anyerr()?;
+    Ok(())
 }

@@ -9,7 +9,7 @@ use tokio::{
 };
 use tracing::{Instrument, debug, warn, warn_span};
 
-use crate::{IROH_DESTINATION_HEADER, PoolOptions, TunnelClientPool, parse::HttpRequest};
+use crate::{IROH_DESTINATION_HEADER, TunnelClientPool, parse::HttpRequest};
 
 pub trait ResolveDestination: Send + Sync + 'static {
     fn resolve_destination<'a>(
@@ -47,20 +47,6 @@ impl ResolveDestination for ResolveDestinationFromHeader {
             }
         }
         .boxed()
-    }
-}
-
-pub struct ProxyOptions {
-    pub pool: PoolOptions,
-    pub parse_destination: Arc<dyn ResolveDestination>,
-}
-
-impl Default for ProxyOptions {
-    fn default() -> Self {
-        Self {
-            pool: Default::default(),
-            parse_destination: Arc::new(ResolveDestinationFromHeader::default()),
-        }
     }
 }
 
