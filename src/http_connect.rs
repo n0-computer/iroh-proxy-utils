@@ -8,16 +8,21 @@ use httparse::{self, Header};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey};
-use n0_error::{AnyError, Result, StdResultExt, anyerr, ensure_any};
+use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr, ensure_any};
+use n0_future::stream::StreamExt;
 use quinn::{RecvStream, SendStream, VarInt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use reqwest::Url;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, error_span, info, instrument, trace, warn};
 
 use crate::error::AuthError;
+use crate::http_connect::parse::{Authority, HttpRequest, RequestKind};
 use crate::util::forward_bidi;
+
+mod parse;
 
 /// how much data to read for the CONNECT handshake before it's considered invalid
 /// 8KB should be plenty.
@@ -33,10 +38,17 @@ const STREAM_OPEN_HANDSHAKE: &[u8] = b"OPEN";
 const CLIENT_CLOSE_MESSAGE: &[u8] = b"DONE";
 
 pub trait AuthHandler: Send + Sync + Debug {
+    // fn authorize_connection<'a>(
+    //     &'a self,
+    //     _remote_id: EndpointId,
+    // ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>> {
+    //     Box::pin(async { Ok(true) })
+    // }
+
     fn authorize<'a>(
         &'a self,
         req: &'a Request,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>>;
 }
 
 /// NoAuthHandler rejects all requests
@@ -47,8 +59,8 @@ impl AuthHandler for NoAuthHandler {
     fn authorize<'a>(
         &'a self,
         _req: &'a Request,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, AuthError>> + Send + 'a>> {
-        Box::pin(async move { Ok(false) })
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>> {
+        Box::pin(async move { Err(AuthError::Forbidden) })
     }
 }
 
@@ -85,6 +97,7 @@ impl TunnelListener {
         Ok(Some((endpoint_send, endpoint_recv)))
     }
 
+    #[instrument(skip_all, fields(target=%format!("{}:{}", req.host, req.port)))]
     async fn handle_connect_request(
         connection: Connection,
         mut s: SendStream,
@@ -110,10 +123,12 @@ impl TunnelListener {
 
             // open a TCP stream to the specified target
             let target_stream = req.tcp_stream().await?;
+            trace!("got target tcp stream");
             let (tcp_recv, tcp_send) = target_stream.into_split();
             let remote_endpoint_id = conn.remote_id();
-            tokio::task::spawn(async move {
-                let res: n0_error::Result<()> = async {
+            tokio::task::spawn(
+                async move {
+                    let res: n0_error::Result<()> = async {
                     debug!("forwarding TCP stream data to bidi QUIC stream");
                     forward_bidi(tcp_recv, tcp_send, proxied_recv.into(), proxied_send.into())
                         .await?;
@@ -124,10 +139,12 @@ impl TunnelListener {
                 }
                 .await;
 
-                if let Err(err) = res {
-                    warn!("connection close error: {:?}", err);
+                    if let Err(err) = res {
+                        warn!("connection close error: {:?}", err);
+                    }
                 }
-            });
+                .instrument(error_span!("tcp-stream",)),
+            );
         }
         trace!("closing tunnel listener");
         Ok(())
@@ -158,14 +175,109 @@ impl TunnelListener {
         Ok(())
     }
 
-    // pub fn close(&self) {
-    //     self.cancel.cancel();
-    //     // TODO - wait & close gracefully
-    //     self.handle.abort();
-    // }
+    async fn handle_streams(
+        auth: Arc<dyn AuthHandler>,
+        remote_id: EndpointId,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) -> Result<()> {
+        let header_names = [IROH_DESTINATION_HEADER];
+        let req = HttpRequest::read(&mut recv, header_names, 8192).await?;
+        // TODO: Validate that the request is for us.
+        // TODO: Authenticate
+        match req.kind {
+            RequestKind::Connect { authority } => {
+                let authority = Authority::parse(&authority)?;
+                match TcpStream::connect(authority.to_addr()).await {
+                    Err(err) => {
+                        warn!("Failed to connect to upstream server: {err:#}");
+                        send_error_response(&mut send, http::StatusCode::BAD_GATEWAY).await?;
+                        send.finish().anyerr()?;
+                    }
+                    Ok(tcp_stream) => {
+                        let status_line = b"HTTP/1.1 200 Connection established\r\n\r\n";
+                        send.write_all(status_line).await.anyerr()?;
+                        let (tcp_recv, mut tcp_send) = tcp_stream.into_split();
+                        tcp_send.write_all(&req.initial_data).await?;
+                        forward_bidi(tcp_recv, tcp_send, recv, send).await?;
+                    }
+                }
+            }
+            RequestKind::Http {
+                method,
+                host: _,
+                path,
+            } => {
+                // TODO: Authenticate
+                // TODO: Filter out headers that should not be forwarded to upstream.
+                let client = reqwest::Client::new();
+                let res = client
+                    .request(method, path)
+                    .headers(req.headers)
+                    .send()
+                    .await
+                    .anyerr()?;
+
+                let status_line = format!(
+                    "{:?} {} {}\r\n",
+                    res.version(),
+                    res.status().as_u16(),
+                    res.status().canonical_reason().unwrap_or_default()
+                );
+                send.write_all(status_line.as_bytes()).await.anyerr()?;
+                for (name, value) in res.headers() {
+                    send.write_all(name.as_str().as_bytes()).await.anyerr()?;
+                    send.write_all(b": ").await.anyerr()?;
+                    send.write_all(value.as_bytes()).await.anyerr()?;
+                    send.write_all(b"\r\n").await.anyerr()?;
+                }
+                send.write_all(b"\r\n").await.anyerr()?;
+                let mut body = res.bytes_stream();
+                while let Some(bytes) = body.next().await {
+                    let bytes = bytes.anyerr()?;
+                    send.write_chunk(bytes).await.anyerr()?;
+                }
+                send.finish().anyerr()?;
+            }
+        }
+        todo!()
+    }
+
+    async fn handle_connection(&self, connection: Connection) -> Result<()> {
+        let remote_id = connection.remote_id();
+        loop {
+            let (send, recv) = connection
+                .accept_bi()
+                .await
+                .std_context("error accepting stream")?;
+            tokio::spawn({
+                let auth = self.auth.clone();
+                async move {
+                    if let Err(err) = Self::handle_streams(auth, remote_id, send, recv).await {
+                        warn!("Failed to handle streams: {err:#}");
+                    }
+                }
+                .instrument(tracing::Span::current())
+            });
+        }
+    }
+}
+
+async fn send_error_response(
+    writer: &mut (impl AsyncWrite + Unpin),
+    status: http::StatusCode,
+) -> Result<()> {
+    let status_line = format!(
+        "HTTP/1.1 {} {}\r\n\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
+    writer.write_all(status_line.as_bytes()).await?;
+    Ok(())
 }
 
 impl ProtocolHandler for TunnelListener {
+    #[instrument("accept", skip_all, fields(remote=%connection.remote_id().fmt_short()))]
     async fn accept(
         &self,
         connection: Connection,
@@ -183,7 +295,11 @@ impl ProtocolHandler for TunnelListener {
         let mut buffer = vec![0u8; CONNECT_HANDSHAKE_MAX_LENGTH];
         r.read(&mut buffer).await.std_context("reading handshake")?;
         let req = Request::parse(&buffer)?;
-        warn!(req = ?req, "read handshake");
+        debug!(?req, "read handshake");
+        trace!(
+            "buffer: {}",
+            std::str::from_utf8(&buffer).unwrap_or_default()
+        );
 
         // TODO - make errors real
         self.auth
@@ -356,7 +472,7 @@ pub struct TunnelClientStreams {
 }
 
 impl TunnelClientStreams {
-    pub async fn new(
+    pub async fn connect(
         local: &Endpoint,
         remote: impl Into<EndpointAddr>,
         host: String,
@@ -364,24 +480,26 @@ impl TunnelClientStreams {
     ) -> Result<Self> {
         let addr = remote.into();
         let remote_ep_id = addr.id;
-        let handshake_bytes = Request::Connect(ProxyConnectRequest {
-            host,
-            port,
-            endpoint_addr: Some(addr.clone()),
-        })
-        .serialize_handshake();
-
-        // connect
         let conn = local
             .connect(addr, IROH_HTTP_CONNECT_ALPN)
             .await
             .std_context(format!("error connecting to {remote_ep_id}"))?;
+        Self::from_connection(conn, host, port).await
+    }
 
+    pub async fn from_connection(conn: Connection, host: String, port: u16) -> Result<Self> {
+        let remote_id = conn.remote_id();
+        let handshake_bytes = Request::Connect(ProxyConnectRequest {
+            host,
+            port,
+            endpoint_addr: None,
+        })
+        .serialize_handshake();
         // open a stream to send the HTTP CONNECT handshake
         let (mut connect_handshake_tx, mut connect_handshake_rx) = conn
             .open_bi()
             .await
-            .std_context(format!("error opening bidi stream to {remote_ep_id}"))?;
+            .std_context(format!("error opening bidi stream to {remote_id}"))?;
         connect_handshake_tx
             .write_all(&handshake_bytes)
             .await
@@ -524,10 +642,7 @@ pub struct ProxyHttpRequest {
 
 impl Request {
     pub fn parse(buffer: &[u8]) -> Result<Self> {
-        let mut headers = [Header {
-            name: IROH_DESTINATION_HEADER,
-            value: b"",
-        }; 32];
+        let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
 
         match req
