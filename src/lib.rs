@@ -6,7 +6,7 @@ mod util;
 
 pub use {
     auth::{AcceptAll, AuthError, AuthHandler, DenyAll},
-    gateway::{GatewayListener, ProxyFailure, ResolveDestination, ResolveDestinationFromHeader},
+    gateway::{ExtractDestination, ResolveDestination, gateway_accept_loop},
     http_connect::{
         ALPN, IROH_DESTINATION_HEADER, PoolOptions, TunnelClientPool, TunnelClientStreams,
         TunnelListener,

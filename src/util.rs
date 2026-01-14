@@ -1,7 +1,6 @@
+use iroh::endpoint::{RecvStream, SendStream};
 use n0_error::{Result, StdResultExt};
-use std::io;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn send_error_response(
     writer: &mut (impl AsyncWrite + Unpin),
@@ -16,89 +15,25 @@ pub(crate) async fn send_error_response(
     Ok(())
 }
 
-fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
-    move |x| {
-        token.cancel();
-        x
-    }
-}
-
 /// Bidirectionally forward data from a quinn stream and an arbitrary tokio
-/// reader/writer pair, aborting both sides when either one forwarder is done,
-/// or when control-c is pressed.
+/// reader/writer pair.
+///
+/// Calls `finish` on the SendStream once done.
 pub async fn forward_bidi(
-    from1: impl AsyncRead + Send + Sync + Unpin + 'static,
-    to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
-    from2: quinn::RecvStream,
-    to2: quinn::SendStream,
+    mut from1: impl AsyncRead + Send + Sync + Unpin,
+    mut to1: impl AsyncWrite + Send + Sync + Unpin,
+    from2: &mut RecvStream,
+    to2: &mut SendStream,
 ) -> Result<()> {
-    let token1 = CancellationToken::new();
-    let token2 = token1.clone();
-    let token3 = token1.clone();
-
-    let forward_from_input_stream = tokio::spawn(async move {
-        copy_to_quinn(from1, to2, token1.clone())
-            .await
-            .map_err(cancel_token(token1))
-    });
-    let forward_to_stdout = tokio::spawn(async move {
-        copy_from_quinn(from2, to1, token2.clone())
-            .await
-            .map_err(cancel_token(token2))
-    });
-    let _control_c = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await?;
-        token3.cancel();
-        io::Result::Ok(())
-    });
-    forward_to_stdout.await.anyerr()?.anyerr()?;
-    forward_from_input_stream.await.anyerr()?.anyerr()?;
-    Ok(())
-}
-
-/// Copy from a reader to a quinn stream.
-///
-/// Will send a reset to the other side if the operation is cancelled, and fail
-/// with an error.
-///
-/// Returns the number of bytes copied in case of success.
-pub(crate) async fn copy_to_quinn(
-    mut from: impl AsyncRead + Unpin,
-    mut send: quinn::SendStream,
-    token: CancellationToken,
-) -> io::Result<u64> {
-    tokio::select! {
-        res = tokio::io::copy(&mut from, &mut send) => {
-            let size = res?;
-            send.finish()?;
-            Ok(size)
-        }
-        _ = token.cancelled() => {
-            // send a reset to the other side immediately
-            send.reset(0u8.into()).ok();
-            Err(io::Error::other("cancelled"))
-        }
-    }
-}
-
-/// Copy from a quinn stream to a writer.
-///
-/// Will send stop to the other side if the operation is cancelled, and fail
-/// with an error.
-///
-/// Returns the number of bytes copied in case of success.
-pub(crate) async fn copy_from_quinn(
-    mut recv: quinn::RecvStream,
-    mut to: impl AsyncWrite + Unpin,
-    token: CancellationToken,
-) -> io::Result<u64> {
-    tokio::select! {
-        res = tokio::io::copy(&mut recv, &mut to) => {
-            Ok(res?)
+    let (r1, r2) = tokio::join!(
+        async {
+            let res = tokio::io::copy(&mut from1, to2).await;
+            to2.finish().ok();
+            res
         },
-        _ = token.cancelled() => {
-            recv.stop(0u8.into()).ok();
-            Err(io::Error::other("cancelled"))
-        }
-    }
+        async { tokio::io::copy(from2, &mut to1).await }
+    );
+    r1.anyerr()?;
+    r2.anyerr()?;
+    Ok(())
 }

@@ -127,7 +127,7 @@ impl HttpRequest {
     }
 
     pub async fn read(
-        reader: &mut (impl AsyncRead + Unpin),
+        mut reader: impl AsyncRead + Unpin,
         max_len: usize,
     ) -> Result<(InitialData, Self)> {
         let mut buf = BytesMut::new();

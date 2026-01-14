@@ -1,24 +1,27 @@
-use std::fmt::Debug;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use http::StatusCode;
-use iroh::endpoint::Connection;
-use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, EndpointId};
+use iroh::{
+    Endpoint, EndpointId,
+    endpoint::{Connection, RecvStream, SendStream},
+    protocol::{AcceptError, ProtocolHandler},
+};
 use iroh_blobs::util::connection_pool::{self, ConnectionPool, ConnectionRef};
-use n0_error::{Result, StdResultExt, anyerr};
+use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr, e, stack_error};
 use n0_future::stream::StreamExt;
-use quinn::{RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, instrument, warn};
 
-use crate::auth::AuthHandler;
-use crate::parse::{Authority, HttpRequest, HttpResponse, RequestKind};
-use crate::util::{forward_bidi, send_error_response};
-use crate::{ProxyFailure, ResolveDestination};
+use crate::{
+    auth::AuthHandler,
+    gateway::ExtractDestination,
+    parse::{Authority, HttpRequest, HttpResponse, RequestKind},
+    util::{forward_bidi, send_error_response},
+};
 
 /// how much data to read for the CONNECT handshake before it's considered invalid
 /// 8KB should be plenty.
@@ -81,11 +84,11 @@ impl TunnelListener {
                     Ok(tcp_stream) => {
                         let status_line = b"HTTP/1.1 200 Connection established\r\n\r\n";
                         send.write_all(status_line).await.anyerr()?;
-                        let (tcp_recv, mut tcp_send) = tcp_stream.into_split();
+                        let (mut tcp_recv, mut tcp_send) = tcp_stream.into_split();
                         tcp_send
                             .write_all(&initial_data.after_header_section())
                             .await?;
-                        forward_bidi(tcp_recv, tcp_send, recv, send).await?;
+                        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut recv, &mut send).await?;
                     }
                 }
             }
@@ -191,16 +194,19 @@ impl TunnelClientPool {
         let cancel_token = CancellationToken::new();
         let _cancel_guard = cancel_token.clone().drop_guard();
         loop {
-            let (client_stream, client_addr) = local_listener.accept().await?;
+            let (mut client_stream, client_addr) = local_listener.accept().await?;
             let this = self.clone();
             let authority = authority.clone();
             let cancel_token = cancel_token.child_token();
             let fut = async move {
                 if let Err(err) = this
-                    .forward_tcp_through_tunnel(destination, &authority, client_stream)
+                    .forward_tcp_through_tunnel(destination, &authority, &mut client_stream)
                     .await
                 {
-                    warn!("Handling local connection closed with error: {err:#}")
+                    warn!("Handling connection closed with error: {err:#}");
+                    if let Some(status) = err.should_reply() {
+                        send_error_response(&mut client_stream, status).await.ok();
+                    }
                 } else {
                     debug!("Connection closed")
                 }
@@ -217,75 +223,53 @@ impl TunnelClientPool {
         &self,
         destination: EndpointId,
         authority: &Authority,
-        tcp_conn: TcpStream,
-    ) -> Result<()> {
-        let (tcp_recv, mut tcp_send) = tcp_conn.into_split();
+        tcp_conn: &mut TcpStream,
+    ) -> Result<(), ProxyError> {
+        let (tcp_recv, mut tcp_send) = tcp_conn.split();
         let initial_data = authority.to_connect_request();
-        let mut conn = match self
-            .connect_and_send_initial_data(destination, initial_data.as_bytes())
+        let mut conn = self
+            .connect_and_send_initial_data(destination, &initial_data.as_bytes())
             .await
-        {
-            Ok(conn) => conn,
-            Err(err) => {
-                warn!("Failed to connect to remote: {err:#}");
-                send_error_response(&mut tcp_send, http::StatusCode::GATEWAY_TIMEOUT).await?;
-                return Ok(());
-            }
-        };
-        let (initial_data, response) = HttpResponse::read(&mut conn.recv, 1024).await?;
-        if response.status != StatusCode::OK {
-            warn!("Remote returned status {}", response.status);
-            send_error_response(&mut tcp_send, response.status).await?;
-            return Ok(());
+            .map_err(|err| e!(ProxyError::FailedToConnect, err))?;
+        let (initial_data, response) = HttpResponse::read(&mut conn.recv, 1024)
+            .await
+            .map_err(|err| e!(ProxyError::RemoteMisbehaved, err))?;
+        let status = response.status;
+        if status != StatusCode::OK {
+            n0_error::bail!(ProxyError::RemoteAborted { status });
         }
         tcp_send
             .write_all(&initial_data.after_header_section())
-            .await?;
-        forward_bidi(tcp_recv, tcp_send, conn.recv, conn.send).await?;
+            .await
+            .map_err(|err| e!(ProxyError::Io, err.into()))?;
+        forward_bidi(tcp_recv, tcp_send, &mut conn.recv, &mut conn.send)
+            .await
+            .map_err(|err| e!(ProxyError::Io, err))?;
         Ok(())
     }
 
     pub async fn forward_http_connection(
         &self,
-        conn: TcpStream,
-        resolve_destination: &dyn ResolveDestination,
-    ) -> Result<(), ProxyFailure> {
-        let (mut tcp_recv, tcp_send) = conn.into_split();
-        let (initial_data, request) =
-            match HttpRequest::read(&mut tcp_recv, HEADER_SECTION_MAX_LENGTH).await {
-                Ok(req) => req,
-                Err(err) => {
-                    return Err(ProxyFailure::new(
-                        tcp_send,
-                        StatusCode::BAD_REQUEST,
-                        err.into(),
-                    ));
-                }
-            };
-        let destination = match resolve_destination.resolve_destination(&request).await {
-            Some(destination) => destination,
-            None => {
-                let err = anyerr!("Failed to parse iroh destination from HTTP request");
-                return Err(ProxyFailure::new(tcp_send, StatusCode::BAD_REQUEST, err));
-            }
-        };
-        let conn = match self
+        conn: &mut TcpStream,
+        extract_destination: &ExtractDestination,
+    ) -> Result<(), ProxyError> {
+        let (mut tcp_recv, mut tcp_send) = conn.split();
+        let (initial_data, request) = HttpRequest::read(&mut tcp_recv, HEADER_SECTION_MAX_LENGTH)
+            .await
+            .map_err(|err| e!(ProxyError::BadRequest, err))?;
+        let destination = extract_destination
+            .extract(&request)
+            .await
+            .context("Failed to parse iroh destination from HTTP request")
+            .map_err(|err| e!(ProxyError::BadRequest, err))?;
+        let mut conn = self
             .connect_and_send_initial_data(destination, &initial_data.full())
             .await
-        {
-            Ok(conn) => conn,
-            Err(err) => {
-                return Err(ProxyFailure::new(
-                    tcp_send,
-                    StatusCode::GATEWAY_TIMEOUT,
-                    err,
-                ));
-            }
-        };
+            .map_err(|err| e!(ProxyError::FailedToConnect, err))?;
 
-        if let Err(err) = forward_bidi(tcp_recv, tcp_send, conn.recv, conn.send).await {
-            warn!("Forwarding to proxy streams closed with error: {err:#}");
-        }
+        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
+            .await
+            .map_err(|err| e!(ProxyError::Io, err))?;
         Ok(())
     }
 }
@@ -294,6 +278,27 @@ pub struct TunnelClientStreams {
     pub send: SendStream,
     pub recv: RecvStream,
     pub conn: ConnectionRef,
+}
+
+#[stack_error(add_meta, derive)]
+pub enum ProxyError {
+    Io { source: AnyError },
+    BadRequest { source: AnyError },
+    FailedToConnect { source: AnyError },
+    RemoteMisbehaved { source: AnyError },
+    RemoteAborted { status: StatusCode },
+}
+
+impl ProxyError {
+    pub fn should_reply(&self) -> Option<StatusCode> {
+        match self {
+            ProxyError::Io { .. } => None,
+            ProxyError::BadRequest { .. } => Some(StatusCode::BAD_REQUEST),
+            ProxyError::FailedToConnect { .. } => Some(StatusCode::GATEWAY_TIMEOUT),
+            ProxyError::RemoteMisbehaved { .. } => Some(StatusCode::BAD_GATEWAY),
+            ProxyError::RemoteAborted { status, .. } => Some(*status),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
