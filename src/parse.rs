@@ -88,7 +88,7 @@ pub struct HttpRequest {
 
 #[derive(Debug, Clone)]
 pub struct InitialData {
-    data: Bytes,
+    pub(crate) data: Bytes,
     body_offset: usize,
 }
 
@@ -98,6 +98,9 @@ impl InitialData {
             data: buf.freeze(),
             body_offset: offset,
         }
+    }
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
     pub fn full(self) -> Bytes {
         self.data

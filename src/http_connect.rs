@@ -1,5 +1,6 @@
 use std::{fmt::Debug, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use http::StatusCode;
 use iroh::{
     Endpoint, EndpointId,
@@ -9,6 +10,7 @@ use iroh::{
 use iroh_blobs::util::connection_pool::{self, ConnectionPool, ConnectionRef};
 use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr, e, stack_error};
 use n0_future::stream::StreamExt;
+use quinn::ConnectionError;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -18,7 +20,7 @@ use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
     auth::AuthHandler,
-    gateway::ExtractDestination,
+    gateway::{ExtractDestination, ForwardMode},
     parse::{Authority, HttpRequest, HttpResponse, RequestKind},
     util::{forward_bidi, send_error_response},
 };
@@ -55,6 +57,8 @@ impl TunnelListener {
     ) -> Result<()> {
         let (initial_data, req) = HttpRequest::read(&mut recv, HEADER_SECTION_MAX_LENGTH).await?;
 
+        debug!(?req, "incoming request");
+
         if let RequestKind::Http {
             authority_from_path,
             ..
@@ -82,12 +86,12 @@ impl TunnelListener {
                         send.finish().anyerr()?;
                     }
                     Ok(tcp_stream) => {
+                        debug!(?authority, "connected to upstream");
                         let status_line = b"HTTP/1.1 200 Connection established\r\n\r\n";
                         send.write_all(status_line).await.anyerr()?;
                         let (mut tcp_recv, mut tcp_send) = tcp_stream.into_split();
-                        tcp_send
-                            .write_all(&initial_data.after_header_section())
-                            .await?;
+                        let initial_request_data = &initial_data.after_header_section();
+                        tcp_send.write_all(&initial_request_data).await?;
                         forward_bidi(&mut tcp_recv, &mut tcp_send, &mut recv, &mut send).await?;
                     }
                 }
@@ -117,10 +121,11 @@ impl TunnelListener {
     async fn handle_connection(&self, connection: Connection) -> Result<()> {
         let remote_id = connection.remote_id();
         loop {
-            let (send, recv) = connection
-                .accept_bi()
-                .await
-                .std_context("error accepting stream")?;
+            let (send, recv) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                Err(ConnectionError::ApplicationClosed(_)) => return Ok(()),
+                Err(err) => return Err(err).std_context("connection closed"),
+            };
             tokio::spawn({
                 let auth = self.auth.clone();
                 async move {
@@ -219,6 +224,28 @@ impl TunnelClientPool {
         }
     }
 
+    async fn create_tunnel(
+        &self,
+        destination: EndpointId,
+        authority: &Authority,
+    ) -> Result<(Bytes, TunnelClientStreams), ProxyError> {
+        let initial_data = authority.to_connect_request();
+        let mut conn = self
+            .connect_and_send_initial_data(destination, &initial_data.as_bytes())
+            .await
+            .map_err(|err| e!(ProxyError::FailedToConnect, err))?;
+        debug!("created tunnel");
+        let (initial_data, response) = HttpResponse::read(&mut conn.recv, 1024)
+            .await
+            .map_err(|err| e!(ProxyError::RemoteMisbehaved, err))?;
+        debug!(?response, "got proxy response");
+        let status = response.status;
+        if status != StatusCode::OK {
+            n0_error::bail!(ProxyError::RemoteAborted { status });
+        }
+        Ok((initial_data.after_header_section(), conn))
+    }
+
     async fn forward_tcp_through_tunnel(
         &self,
         destination: EndpointId,
@@ -226,20 +253,9 @@ impl TunnelClientPool {
         tcp_conn: &mut TcpStream,
     ) -> Result<(), ProxyError> {
         let (tcp_recv, mut tcp_send) = tcp_conn.split();
-        let initial_data = authority.to_connect_request();
-        let mut conn = self
-            .connect_and_send_initial_data(destination, &initial_data.as_bytes())
-            .await
-            .map_err(|err| e!(ProxyError::FailedToConnect, err))?;
-        let (initial_data, response) = HttpResponse::read(&mut conn.recv, 1024)
-            .await
-            .map_err(|err| e!(ProxyError::RemoteMisbehaved, err))?;
-        let status = response.status;
-        if status != StatusCode::OK {
-            n0_error::bail!(ProxyError::RemoteAborted { status });
-        }
+        let (initial_response_data, mut conn) = self.create_tunnel(destination, authority).await?;
         tcp_send
-            .write_all(&initial_data.after_header_section())
+            .write_all(&initial_response_data)
             .await
             .map_err(|err| e!(ProxyError::Io, err.into()))?;
         forward_bidi(tcp_recv, tcp_send, &mut conn.recv, &mut conn.send)
@@ -257,19 +273,39 @@ impl TunnelClientPool {
         let (initial_data, request) = HttpRequest::read(&mut tcp_recv, HEADER_SECTION_MAX_LENGTH)
             .await
             .map_err(|err| e!(ProxyError::BadRequest, err))?;
-        let destination = extract_destination
-            .extract(&request)
-            .await
+        debug!(initial_data_len = initial_data.len(), "read request");
+        let destination = extract_destination.extract(&request).await;
+        debug!(?destination, "extracted destination");
+        let destination = destination
             .context("Failed to parse iroh destination from HTTP request")
             .map_err(|err| e!(ProxyError::BadRequest, err))?;
-        let mut conn = self
-            .connect_and_send_initial_data(destination, &initial_data.full())
-            .await
-            .map_err(|err| e!(ProxyError::FailedToConnect, err))?;
+
+        let mut conn = match destination.mode {
+            ForwardMode::Unchanged => self
+                .connect_and_send_initial_data(destination.endpoint_id, &initial_data.full())
+                .await
+                .map_err(|err| e!(ProxyError::FailedToConnect, err))?,
+            ForwardMode::ConnectTunnel(authority) => {
+                let (initial_response_data, mut conn) = self
+                    .create_tunnel(destination.endpoint_id, &authority)
+                    .await?;
+                tcp_send
+                    .write_all(&initial_response_data)
+                    .await
+                    .map_err(|err| e!(ProxyError::Io, err.into()))?;
+                conn.send
+                    .write_all(&initial_data.full())
+                    .await
+                    .map_err(|err| e!(ProxyError::Io, anyerr!(err)))?;
+                conn
+            }
+        };
+        debug!("connected to remote");
 
         forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
             .await
             .map_err(|err| e!(ProxyError::Io, err))?;
+        debug!("closed");
         Ok(())
     }
 }

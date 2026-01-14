@@ -6,7 +6,8 @@ use tokio::net::TcpListener;
 use tracing::{Instrument, debug, warn, warn_span};
 
 use crate::{
-    IROH_DESTINATION_HEADER, TunnelClientPool, parse::HttpRequest, util::send_error_response,
+    Authority, IROH_DESTINATION_HEADER, TunnelClientPool, parse::HttpRequest,
+    util::send_error_response,
 };
 
 #[derive(derive_more::Debug, Clone, Default)]
@@ -37,7 +38,7 @@ impl From<Arc<dyn ResolveDestination>> for ExtractDestination {
 }
 
 impl ExtractDestination {
-    pub async fn extract<'a>(&'a self, req: &'a HttpRequest) -> Option<EndpointId> {
+    pub async fn extract<'a>(&'a self, req: &'a HttpRequest) -> Option<Destination> {
         match self {
             ExtractDestination::DefaultHeader => extract_header(req, IROH_DESTINATION_HEADER),
             ExtractDestination::Header(header_name) => extract_header(req, header_name),
@@ -46,9 +47,25 @@ impl ExtractDestination {
     }
 }
 
-fn extract_header(req: &HttpRequest, header_name: &str) -> Option<EndpointId> {
+#[derive(Debug, Clone)]
+pub struct Destination {
+    pub endpoint_id: EndpointId,
+    pub mode: ForwardMode,
+}
+
+#[derive(Debug, Clone)]
+pub enum ForwardMode {
+    Unchanged,
+    ConnectTunnel(Authority),
+}
+
+fn extract_header(req: &HttpRequest, header_name: &str) -> Option<Destination> {
     if let Some(value) = req.headers.get(header_name) {
-        EndpointId::from_str(value.to_str().ok()?).ok()
+        let endpoint_id = EndpointId::from_str(value.to_str().ok()?).ok()?;
+        Some(Destination {
+            endpoint_id,
+            mode: ForwardMode::Unchanged,
+        })
     } else {
         None
     }
@@ -60,7 +77,7 @@ pub trait ResolveDestination: Send + Sync + 'static {
     fn resolve_destination<'a>(
         &'a self,
         req: &'a HttpRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<EndpointId>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Option<Destination>> + Send + 'a>>;
 }
 
 /// Runs an accept loop on `listener` and forwards incoming connection.
