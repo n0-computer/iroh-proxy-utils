@@ -4,7 +4,7 @@ use dynosaur::dynosaur;
 use iroh::EndpointId;
 use n0_error::StackError;
 
-use crate::parse::HttpRequest;
+use crate::parse::HttpProxyRequest;
 
 #[derive(StackError)]
 pub enum AuthError {
@@ -19,7 +19,7 @@ pub trait AuthHandler: Send + Sync {
     fn authorize<'a>(
         &'a self,
         remote_id: EndpointId,
-        req: &'a HttpRequest,
+        req: &'a HttpProxyRequest,
     ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a;
 }
 
@@ -30,7 +30,7 @@ impl AuthHandler for DenyAll {
     fn authorize<'a>(
         &'a self,
         _remote_id: EndpointId,
-        _req: &'a HttpRequest,
+        _req: &'a HttpProxyRequest,
     ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a {
         async move { Err(AuthError::Forbidden) }
     }
@@ -43,7 +43,7 @@ impl AuthHandler for AcceptAll {
     fn authorize<'a>(
         &'a self,
         _remote_id: EndpointId,
-        _req: &'a HttpRequest,
+        _req: &'a HttpProxyRequest,
     ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a {
         async move { Ok(()) }
     }

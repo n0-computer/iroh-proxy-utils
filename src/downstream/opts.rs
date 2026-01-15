@@ -165,6 +165,12 @@ impl<T: ExtractEndpointAuthority + 'static> From<T> for ReverseProxyMode {
     }
 }
 
+impl From<EndpointAuthority> for ReverseProxyMode {
+    fn from(value: EndpointAuthority) -> Self {
+        Self::Static(value)
+    }
+}
+
 #[dynosaur(DynExtractEndpoint = dyn(box) ExtractEndpoint)]
 pub trait ExtractEndpoint: Send + Sync {
     fn extract_endpoint<'a>(
@@ -214,6 +220,7 @@ impl WriteErrorResponse for DefaultResponseWriter {
 pub enum ExtractError {
     Unauthorized,
     NotFound,
+    BadRequest,
     InternalError,
 }
 
@@ -222,6 +229,7 @@ impl ExtractError {
         match self {
             ExtractError::Unauthorized => StatusCode::UNAUTHORIZED,
             ExtractError::NotFound => StatusCode::NOT_FOUND,
+            ExtractError::BadRequest => StatusCode::BAD_REQUEST,
             ExtractError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -7,7 +7,7 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
-use n0_error::{Result, StdResultExt, anyerr};
+use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::stream::{self, StreamExt};
 use quinn::ConnectionError;
 use tokio::net::TcpStream;
@@ -15,7 +15,7 @@ use tracing::{Instrument, debug, instrument, warn};
 
 use crate::{
     HEADER_SECTION_MAX_LENGTH,
-    parse::{HttpProxyRequestKind, HttpRequest, HttpRequestKind},
+    parse::{HttpProxyRequestKind, HttpRequest},
     util::{Prebuffered, forward_bidi, write_http_response, write_reqwest_response},
 };
 
@@ -79,10 +79,14 @@ impl UpstreamProxy {
         mut send: SendStream,
         recv: RecvStream,
     ) -> Result<()> {
-        let mut recv = Prebuffered::new(recv);
-        let req = HttpRequest::read(&mut recv, HEADER_SECTION_MAX_LENGTH).await?;
+        let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
+        let req = HttpRequest::read(&mut recv).await?;
+        let header_section_len = req.header_section_len;
 
         debug!(?req, "incoming request");
+        let req = req
+            .try_into_proxy_request()
+            .context("Received origin-form request but expected proxy request")?;
 
         match auth.authorize(remote_id, &req).await {
             Ok(()) => debug!("request is authorized, continue"),
@@ -93,9 +97,9 @@ impl UpstreamProxy {
         };
 
         match req.kind {
-            HttpRequestKind::Proxy(HttpProxyRequestKind::Tunnel { target: authority }) => {
+            HttpProxyRequestKind::Tunnel { target: authority } => {
                 // Remove the CONNECT request from the recv stream, because it is not forwarded to the origin server.
-                recv.discard(req.header_section_len);
+                recv.discard(header_section_len);
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to upstream server: {err:#}");
@@ -116,7 +120,7 @@ impl UpstreamProxy {
                 }
                 Ok(())
             }
-            HttpRequestKind::Proxy(HttpProxyRequestKind::Absolute { method, target }) => {
+            HttpProxyRequestKind::Absolute { method, target } => {
                 let client = reqwest::Client::new();
 
                 // Convert the Prebuffered<RecvStream> into a stream of Result<Bytes, std::io::Error>
@@ -137,7 +141,7 @@ impl UpstreamProxy {
                 // Forward the request to the upstream server.
                 let res = client
                     .request(method, target)
-                    // TODO: Filter out headers that should not be forwarded to upstream.
+                    // TODO: Filter out into_proxy_requestinto_proxy_requestheaders that should not be forwarded to upstream.
                     .headers(req.headers)
                     .body(reqwest::Body::wrap_stream(body))
                     .send()
@@ -153,9 +157,6 @@ impl UpstreamProxy {
                 send.finish().anyerr()?;
                 Ok(())
             }
-            HttpRequestKind::Origin { .. } => Err(anyerr!(
-                "Invalid request: Received origin-form HTTP request without reverse-proxy context"
-            )),
         }
     }
 }

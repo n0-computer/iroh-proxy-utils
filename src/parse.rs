@@ -93,6 +93,12 @@ pub enum HttpProxyRequestKind {
 }
 
 #[derive(derive_more::Debug)]
+pub struct HttpProxyRequest {
+    pub kind: HttpProxyRequestKind,
+    pub headers: http::HeaderMap<http::HeaderValue>,
+}
+
+#[derive(derive_more::Debug)]
 pub struct HttpRequest {
     pub kind: HttpRequestKind,
     pub headers: http::HeaderMap<http::HeaderValue>,
@@ -100,17 +106,18 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub async fn read(
-        reader: &mut Prebuffered<impl AsyncRead + Unpin>,
-        max_len: usize,
-    ) -> Result<Self> {
-        while reader.buffer().len() < max_len {
-            reader.buffer_more(max_len - reader.buffer().len()).await?;
+    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+        while !reader.is_full() {
+            reader.buffer_more().await?;
             if let Some(request) = Self::parse(reader.buffer())? {
                 return Ok(request);
             }
         }
-        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF").into())
+        Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "Buffer size limit reached before end of request header section",
+        )
+        .into())
     }
 
     pub fn parse(buf: &[u8]) -> Result<Option<Self>> {
@@ -163,6 +170,18 @@ impl HttpRequest {
             header_section_len,
         })
     }
+
+    pub fn try_into_proxy_request(self) -> Result<HttpProxyRequest> {
+        match self.kind {
+            HttpRequestKind::Proxy(kind) => Ok(HttpProxyRequest {
+                kind,
+                headers: self.headers,
+            }),
+            HttpRequestKind::Origin { .. } => {
+                Err(anyerr!("Request is origin-form and not a proxy request"))
+            }
+        }
+    }
 }
 
 #[derive(derive_more::Debug)]
@@ -184,12 +203,9 @@ impl HttpResponse {
         status_line(self.status, self.reason.as_deref())
     }
 
-    pub async fn read(
-        reader: &mut Prebuffered<impl AsyncRead + Unpin>,
-        max_len: usize,
-    ) -> Result<Self> {
-        while reader.buffer().len() < max_len {
-            reader.buffer_more(max_len - reader.buffer().len()).await?;
+    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+        while !reader.is_full() {
+            reader.buffer_more().await?;
 
             let mut headers = [httparse::EMPTY_HEADER; 0];
             let mut res = httparse::Response::new(&mut headers);
@@ -200,8 +216,9 @@ impl HttpResponse {
             {
                 httparse::Status::Partial => continue,
                 httparse::Status::Complete(header_section_len) => {
-                    let status = http::StatusCode::from_u16(res.code.unwrap_or(500))
-                        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                    let code = res.code.context("Missing response status code")?;
+                    let status =
+                        StatusCode::from_u16(code).std_context("Invalid response status code")?;
                     let reason = res.reason.map(ToOwned::to_owned);
                     return Ok(HttpResponse {
                         status,
@@ -212,6 +229,10 @@ impl HttpResponse {
             }
         }
 
-        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF").into())
+        Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "Buffer size limit reached before end of respones header section",
+        )
+        .into())
     }
 }

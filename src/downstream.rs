@@ -48,7 +48,7 @@ impl DownstreamProxy {
             .write_all(destination.authority.to_connect_request().as_bytes())
             .await?;
         debug!("created tunnel");
-        let response = HttpResponse::read(&mut conn.recv, 1024)
+        let response = HttpResponse::read(&mut conn.recv)
             .await
             .map_err(|err| ProxyError::bad_gateway(err))?;
         debug!(?response, "got proxy response");
@@ -99,8 +99,8 @@ impl DownstreamProxy {
         opts: &ProxyOpts,
     ) -> Result<(), ProxyError> {
         let (tcp_recv, mut tcp_send) = conn.split();
-        let mut tcp_recv = Prebuffered::new(tcp_recv);
-        let request = HttpRequest::read(&mut tcp_recv, HEADER_SECTION_MAX_LENGTH)
+        let mut tcp_recv = Prebuffered::new(tcp_recv, HEADER_SECTION_MAX_LENGTH);
+        let request = HttpRequest::read(&mut tcp_recv)
             .await
             .map_err(|err| ProxyError::bad_request(err))?;
         debug!(?request, "read request");
@@ -137,7 +137,7 @@ impl DownstreamProxy {
             .open_bi()
             .await
             .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))?;
-        let recv = Prebuffered::new(recv);
+        let recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
         Ok(TunnelClientStreams { send, recv, conn })
     }
 }
@@ -152,6 +152,15 @@ pub struct TunnelClientStreams {
 pub struct EndpointAuthority {
     pub endpoint_id: EndpointId,
     pub authority: Authority,
+}
+
+impl EndpointAuthority {
+    pub fn new(endpoint_id: EndpointId, authority: Authority) -> Self {
+        Self {
+            endpoint_id,
+            authority,
+        }
+    }
 }
 
 #[stack_error(add_meta, derive)]
