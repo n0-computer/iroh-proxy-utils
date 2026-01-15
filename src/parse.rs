@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bytes::{Bytes, BytesMut};
-use http::{HeaderValue, StatusCode, uri::Scheme};
+use http::{HeaderValue, Method, StatusCode, header::HOST, uri::Scheme};
 use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::io::{self, AsyncRead, AsyncReadExt};
 
@@ -69,20 +69,28 @@ impl Authority {
 }
 
 #[derive(Debug)]
-pub enum RequestKind {
-    Connect {
-        authority: Authority,
-    },
-    Http {
-        method: http::Method,
+pub enum HttpRequestKind {
+    /// Tunnel or forward-proxy request.
+    Proxy(HttpProxyRequestKind),
+    /// Direct origin request with origin-form request target.
+    Origin {
         path: String,
-        authority_from_path: Option<Authority>,
+        host: Option<String>,
+        method: Method,
     },
+}
+
+#[derive(Debug)]
+pub enum HttpProxyRequestKind {
+    /// Tunnel CONNECT request with authority-form request target.
+    Tunnel { target: Authority },
+    /// Forward-proxy request with absolute-form request target.
+    Absolute { target: String, method: Method },
 }
 
 #[derive(derive_more::Debug)]
 pub struct HttpRequest {
-    pub kind: RequestKind,
+    pub kind: HttpRequestKind,
     pub headers: http::HeaderMap<http::HeaderValue>,
 }
 
@@ -178,15 +186,31 @@ impl HttpRequest {
                     .to_string();
                 let authority = Authority::from_host_str(&authority)
                     .context("Invalid HTTP CONNECT request: Invalid authority string")?;
-                RequestKind::Connect { authority }
+                HttpRequestKind::Proxy(HttpProxyRequestKind::Tunnel { target: authority })
             }
             _ => {
                 let path = req.path.unwrap_or_default().to_string();
-                let authority_from_path = Authority::from_uri(&path).ok();
-                RequestKind::Http {
-                    method,
-                    path: path.to_string(),
-                    authority_from_path,
+                let uri = http::uri::Uri::from_str(&path).ok();
+                let is_absolute = uri
+                    .as_ref()
+                    .and_then(|uri| uri.scheme())
+                    .is_some();
+                if is_absolute {
+                    HttpRequestKind::Proxy(HttpProxyRequestKind::Absolute { method, target: path })
+                } else {
+                    let headers = http::HeaderMap::from_iter(req.headers.iter().flat_map(|h| {
+                        let value = HeaderValue::from_bytes(h.value).ok()?;
+                        let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
+                        Some((name, value))
+                    }));
+                    let host = headers
+                        .get(HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string());
+                    return Ok(Self {
+                        kind: HttpRequestKind::Origin { path, host, method },
+                        headers,
+                    });
                 }
             }
         };

@@ -2,14 +2,15 @@ use iroh::endpoint::{RecvStream, SendStream};
 use n0_error::{Result, StdResultExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-pub(crate) async fn send_error_response(
+pub(crate) async fn write_http_response_message(
     writer: &mut (impl AsyncWrite + Unpin),
     status: http::StatusCode,
+    reason: Option<&str>,
 ) -> Result<()> {
     let status_line = format!(
         "HTTP/1.1 {} {}\r\n\r\n",
         status.as_u16(),
-        status.canonical_reason().unwrap_or("")
+        reason.or(status.canonical_reason()).unwrap_or("")
     );
     writer.write_all(status_line.as_bytes()).await?;
     Ok(())

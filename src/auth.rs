@@ -1,5 +1,6 @@
-use std::{fmt::Debug, pin::Pin};
+use std::future::Future;
 
+use dynosaur::dynosaur;
 use iroh::EndpointId;
 use n0_error::StackError;
 
@@ -13,12 +14,13 @@ pub enum AuthError {
     BadRequest,
 }
 
-pub trait AuthHandler: Send + Sync + Debug {
+#[dynosaur(pub DynAuthHandler = dyn(box) AuthHandler)]
+pub trait AuthHandler: Send + Sync {
     fn authorize<'a>(
         &'a self,
         remote_id: EndpointId,
         req: &'a HttpRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>>;
+    ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a;
 }
 
 #[derive(Debug)]
@@ -29,8 +31,8 @@ impl AuthHandler for DenyAll {
         &'a self,
         _remote_id: EndpointId,
         _req: &'a HttpRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>> {
-        Box::pin(async move { Err(AuthError::Forbidden) })
+    ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a {
+        async move { Err(AuthError::Forbidden) }
     }
 }
 
@@ -42,7 +44,7 @@ impl AuthHandler for AcceptAll {
         &'a self,
         _remote_id: EndpointId,
         _req: &'a HttpRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AuthError>> + Send + 'a>> {
-        Box::pin(async move { Ok(()) })
+    ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a {
+        async move { Ok(()) }
     }
 }
