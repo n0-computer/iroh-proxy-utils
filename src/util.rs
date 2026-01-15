@@ -1,11 +1,6 @@
-use std::io;
-
 use iroh::endpoint::SendStream;
 use n0_error::{Result, StdResultExt};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    net::tcp::OwnedWriteHalf,
-};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub(crate) use self::prebuffered::Prebuffered;
 
@@ -58,48 +53,23 @@ pub(crate) async fn write_reqwest_response(
 /// Calls `finish` on the SendStream once done.
 pub(crate) async fn forward_bidi(
     left_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    left_send: &mut impl FinishAsyncWrite,
+    left_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
     right_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    right_send: &mut impl FinishAsyncWrite,
+    right_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
 ) -> Result<()> {
     let (r1, r2) = tokio::join!(
         async {
             let res = tokio::io::copy(left_recv, right_send).await;
-            right_send.finish().await.ok();
+            right_send.shutdown().await.ok();
             res
         },
         async {
             let res = tokio::io::copy(right_recv, left_send).await;
-            left_send.finish().await.ok();
+            left_send.shutdown().await.ok();
             res
         }
     );
     r1.anyerr()?;
     r2.anyerr()?;
     Ok(())
-}
-
-pub(crate) trait FinishAsyncWrite: AsyncWrite + Send + Sync + Unpin {
-    fn finish(&mut self) -> impl Future<Output = io::Result<()>> + Send {
-        async { Ok(()) }
-    }
-}
-
-impl FinishAsyncWrite for SendStream {
-    async fn finish(&mut self) -> io::Result<()> {
-        SendStream::finish(self)?;
-        Ok(())
-    }
-}
-
-impl<'a> FinishAsyncWrite for tokio::net::tcp::WriteHalf<'a> {
-    async fn finish(&mut self) -> io::Result<()> {
-        self.shutdown().await
-    }
-}
-
-impl FinishAsyncWrite for OwnedWriteHalf {
-    async fn finish(&mut self) -> io::Result<()> {
-        self.shutdown().await
-    }
 }
