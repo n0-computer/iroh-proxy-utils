@@ -1,3 +1,5 @@
+use std::io;
+
 use iroh::endpoint::SendStream;
 use n0_error::{Result, StdResultExt};
 use tokio::{
@@ -63,12 +65,12 @@ pub(crate) async fn forward_bidi(
     let (r1, r2) = tokio::join!(
         async {
             let res = tokio::io::copy(left_recv, right_send).await;
-            right_send.finish();
+            right_send.finish().await.ok();
             res
         },
         async {
             let res = tokio::io::copy(right_recv, left_send).await;
-            left_send.finish();
+            left_send.finish().await.ok();
             res
         }
     );
@@ -78,19 +80,26 @@ pub(crate) async fn forward_bidi(
 }
 
 pub(crate) trait FinishAsyncWrite: AsyncWrite + Send + Sync + Unpin {
-    fn finish(&mut self) {}
+    fn finish(&mut self) -> impl Future<Output = io::Result<()>> + Send {
+        async { Ok(()) }
+    }
 }
 
 impl FinishAsyncWrite for SendStream {
-    fn finish(&mut self) {
-        SendStream::finish(self).ok();
+    async fn finish(&mut self) -> io::Result<()> {
+        SendStream::finish(self)?;
+        Ok(())
     }
 }
 
 impl<'a> FinishAsyncWrite for tokio::net::tcp::WriteHalf<'a> {
-    fn finish(&mut self) {}
+    async fn finish(&mut self) -> io::Result<()> {
+        self.shutdown().await
+    }
 }
 
 impl FinishAsyncWrite for OwnedWriteHalf {
-    fn finish(&mut self) {}
+    async fn finish(&mut self) -> io::Result<()> {
+        self.shutdown().await
+    }
 }
