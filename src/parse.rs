@@ -1,9 +1,13 @@
 use std::str::FromStr;
 
-use bytes::{Bytes, BytesMut};
-use http::{HeaderValue, Method, StatusCode, header::HOST, uri::Scheme};
-use n0_error::{Result, StackResultExt, StdResultExt};
-use tokio::io::{self, AsyncRead, AsyncReadExt};
+use http::{
+    HeaderValue, Method, StatusCode,
+    uri::{Scheme, Uri},
+};
+use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
+use tokio::io::{self, AsyncRead};
+
+use crate::util::{Prebuffered, status_line};
 
 #[derive(Debug, Clone, derive_more::Display)]
 #[display("{host}:{port}")]
@@ -15,46 +19,46 @@ pub struct Authority {
 impl FromStr for Authority {
     type Err = n0_error::AnyError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_host_str(s)
+        Self::from_authority_str(s)
     }
 }
 
 impl Authority {
-    pub fn from_host_str(authority: &str) -> Result<Self> {
-        // Split into host and port
-        let (host, port_str) = authority.rsplit_once(':').ok_or_else(|| {
-            n0_error::AnyError::from_string("Invalid CONNECT path, expected host:port".to_string())
-        })?;
-        let host = host
-            .strip_prefix("https://")
-            .or_else(|| host.strip_prefix("http://"))
-            .unwrap_or(host);
-
-        let port: u16 = port_str
-            .trim_end_matches('/')
-            .parse()
-            .map_err(|e| {
-                n0_error::AnyError::from_string(format!("Invalid port number {port_str}: {}", e))
-            })
-            .anyerr()?;
+    pub fn from_authority_uri(uri: &Uri) -> Result<Self> {
+        ensure_any!(uri.scheme().is_none(), "Expected URI without scheme");
+        ensure_any!(uri.path_and_query().is_none(), "Expected URI without path");
+        let authority = uri.authority().context("Expected URI with authority")?;
+        let host = authority.host();
+        let port = authority.port_u16().context("Expected URI with port")?;
         Ok(Self {
             host: host.to_string(),
             port,
         })
     }
 
-    pub fn from_uri(uri: &str) -> Result<Self> {
-        let uri = http::uri::Uri::from_str(uri).std_context("Invalid URI")?;
-        let host = uri.host().context("Missing host")?.to_string();
-        let port = match uri.port_u16() {
+    pub fn from_absolute_uri(uri: &Uri) -> Result<Self> {
+        let authority = uri.authority().context("Expected URI with authority")?;
+        let host = authority.host();
+        let port = match authority.port_u16() {
             Some(port) => port,
-            None => match uri.scheme().context("Missing scheme")? {
-                x if x == &Scheme::HTTP => 80,
-                x if x == &Scheme::HTTPS => 443,
-                _ => n0_error::bail_any!("Invalid scheme"),
+            None => match uri.scheme() {
+                Some(scheme) if *scheme == Scheme::HTTP => 80,
+                Some(scheme) if *scheme == Scheme::HTTPS => 443,
+                _ => Err(anyerr!("Expected URI to with port or http(s) scheme"))?,
             },
         };
-        Ok(Self { host, port })
+        Ok(Self {
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    pub fn from_authority_str(s: &str) -> Result<Self> {
+        Self::from_authority_uri(&Uri::from_str(s).std_context("Invalid authority string")?)
+    }
+
+    pub fn from_absolute_uri_str(s: &str) -> Result<Self> {
+        Self::from_absolute_uri(&Uri::from_str(s).std_context("Invalid authority string")?)
     }
 
     pub(super) fn to_addr(&self) -> String {
@@ -92,172 +96,118 @@ pub enum HttpProxyRequestKind {
 pub struct HttpRequest {
     pub kind: HttpRequestKind,
     pub headers: http::HeaderMap<http::HeaderValue>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InitialData {
-    pub(crate) data: Bytes,
-    body_offset: usize,
-}
-
-impl InitialData {
-    fn new(buf: BytesMut, offset: usize) -> Self {
-        Self {
-            data: buf.freeze(),
-            body_offset: offset,
-        }
-    }
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-    pub fn full(self) -> Bytes {
-        self.data
-    }
-
-    pub fn end_of_header_section(&self) -> usize {
-        self.body_offset
-    }
-
-    pub fn after_header_section(mut self) -> Bytes {
-        self.data.split_off(self.body_offset)
-    }
+    pub(crate) header_section_len: usize,
 }
 
 impl HttpRequest {
-    pub fn parse(buf: &[u8]) -> Result<Self> {
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut req = httparse::Request::new(&mut headers);
-        if req
-            .parse(&buf[..])
-            .std_context("Failed to parse HTTP request")?
-            .is_partial()
-        {
-            n0_error::bail_any!("Incomplete HTTP request");
-        }
-        Self::from_request(req)
-    }
-
     pub async fn read(
-        mut reader: impl AsyncRead + Unpin,
+        reader: &mut Prebuffered<impl AsyncRead + Unpin>,
         max_len: usize,
-    ) -> Result<(InitialData, Self)> {
-        let mut buf = BytesMut::new();
-        while buf.len() < max_len {
-            let n = reader.read_buf(&mut buf).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "Header section longer than memory limit",
-                )
-                .into());
-            }
-
-            let mut headers = [httparse::EMPTY_HEADER; 64];
-            let mut req = httparse::Request::new(&mut headers);
-
-            match req
-                .parse(&buf[..])
-                .std_context("Failed to parse HTTP request")?
-            {
-                httparse::Status::Partial => continue,
-                httparse::Status::Complete(body_offset) => {
-                    let request = Self::from_request(req)?;
-                    let initial_data = InitialData::new(buf, body_offset);
-                    return Ok((initial_data, request));
-                }
+    ) -> Result<Self> {
+        while reader.buffer().len() < max_len {
+            reader.buffer_more(max_len - reader.buffer().len()).await?;
+            if let Some(request) = Self::parse(reader.buffer())? {
+                return Ok(request);
             }
         }
-
         Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF").into())
     }
 
-    fn from_request<'a>(req: httparse::Request) -> Result<Self> {
-        let method = req
-            .method
-            .context("Invalid HTTP request: Missing HTTP method")?;
-        let method = method
-            .parse()
-            .std_context("Invalid HTTP request: Invalid method")?;
-        let kind = match method {
-            http::Method::CONNECT => {
-                let authority = req
-                    .path
-                    .context("Invalid HTTP CONNECT request: Missing authority")?
-                    .to_string();
-                let authority = Authority::from_host_str(&authority)
-                    .context("Invalid HTTP CONNECT request: Invalid authority string")?;
-                HttpRequestKind::Proxy(HttpProxyRequestKind::Tunnel { target: authority })
+    pub fn parse(buf: &[u8]) -> Result<Option<Self>> {
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(&buf[..]).std_context("Invalid HTTP request")? {
+            httparse::Status::Partial => Ok(None),
+            httparse::Status::Complete(body_offset) => {
+                Self::from_request(req, body_offset).map(Some)
             }
-            _ => {
-                let path = req.path.unwrap_or_default().to_string();
-                let uri = http::uri::Uri::from_str(&path).ok();
-                let is_absolute = uri
-                    .as_ref()
-                    .and_then(|uri| uri.scheme())
-                    .is_some();
-                if is_absolute {
-                    HttpRequestKind::Proxy(HttpProxyRequestKind::Absolute { method, target: path })
-                } else {
-                    let headers = http::HeaderMap::from_iter(req.headers.iter().flat_map(|h| {
-                        let value = HeaderValue::from_bytes(h.value).ok()?;
-                        let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
-                        Some((name, value))
-                    }));
-                    let host = headers
-                        .get(HOST)
-                        .and_then(|value| value.to_str().ok())
-                        .map(|value| value.to_string());
-                    return Ok(Self {
-                        kind: HttpRequestKind::Origin { path, host, method },
-                        headers,
-                    });
-                }
-            }
-        };
+        }
+    }
+
+    fn from_request<'a>(req: httparse::Request, header_section_len: usize) -> Result<Self> {
+        let method_str = req.method.context("Missing HTTP method")?;
+        let method = method_str.parse().std_context("Invalid HTTP method")?;
+        let path = req.path.context("Missing request target")?;
+        let uri = Uri::from_str(path).std_context("Invalid request target")?;
         let headers = http::HeaderMap::from_iter(req.headers.into_iter().flat_map(|h| {
             let value = HeaderValue::from_bytes(h.value).ok()?;
             let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
             Some((name, value))
         }));
-        Ok(Self { kind, headers })
+        let kind = match method {
+            Method::CONNECT => {
+                let authority = Authority::from_authority_uri(&uri)?;
+                HttpRequestKind::Proxy(HttpProxyRequestKind::Tunnel { target: authority })
+            }
+            _ => {
+                if uri.scheme().is_some() {
+                    HttpRequestKind::Proxy(HttpProxyRequestKind::Absolute {
+                        target: path.to_string(),
+                        method,
+                    })
+                } else {
+                    let host = headers
+                        .get("host")
+                        .and_then(|x| Some(x.to_str().ok()?.to_string()));
+                    HttpRequestKind::Origin {
+                        path: path.to_string(),
+                        host,
+                        method,
+                    }
+                }
+            }
+        };
+        Ok(Self {
+            kind,
+            headers,
+            header_section_len,
+        })
     }
 }
 
 #[derive(derive_more::Debug)]
 pub struct HttpResponse {
     pub status: StatusCode,
+    pub reason: Option<String>,
+    pub(crate) header_section_len: usize,
 }
 
 impl HttpResponse {
+    pub fn reason(&self) -> &str {
+        self.reason
+            .as_deref()
+            .or(self.status.canonical_reason())
+            .unwrap_or("")
+    }
+
+    pub fn status_line(&self) -> String {
+        status_line(self.status, self.reason.as_deref())
+    }
+
     pub async fn read(
-        reader: &mut (impl AsyncRead + Unpin),
+        reader: &mut Prebuffered<impl AsyncRead + Unpin>,
         max_len: usize,
-    ) -> Result<(InitialData, Self)> {
-        let mut buf = BytesMut::new();
-        while buf.len() < max_len {
-            let n = reader.read_buf(&mut buf).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "Header section longer than memory limit",
-                )
-                .into());
-            }
+    ) -> Result<Self> {
+        while reader.buffer().len() < max_len {
+            reader.buffer_more(max_len - reader.buffer().len()).await?;
 
             let mut headers = [httparse::EMPTY_HEADER; 0];
             let mut res = httparse::Response::new(&mut headers);
 
             match res
-                .parse(&buf[..])
+                .parse(&reader.buffer())
                 .std_context("Failed to parse HTTP request")?
             {
                 httparse::Status::Partial => continue,
-                httparse::Status::Complete(body_offset) => {
+                httparse::Status::Complete(header_section_len) => {
                     let status = http::StatusCode::from_u16(res.code.unwrap_or(500))
                         .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-                    let response = HttpResponse { status };
-                    let initial_data = InitialData::new(buf, body_offset);
-                    return Ok((initial_data, response));
+                    let reason = res.reason.map(ToOwned::to_owned);
+                    return Ok(HttpResponse {
+                        status,
+                        reason,
+                        header_section_len,
+                    });
                 }
             }
         }

@@ -14,7 +14,7 @@ pub enum AuthError {
     BadRequest,
 }
 
-#[dynosaur(pub DynAuthHandler = dyn(box) AuthHandler)]
+#[dynosaur(pub(crate) DynAuthHandler = dyn(box) AuthHandler)]
 pub trait AuthHandler: Send + Sync {
     fn authorize<'a>(
         &'a self,
