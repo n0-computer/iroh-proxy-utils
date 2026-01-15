@@ -1,6 +1,7 @@
 mod auth;
 mod gateway;
 mod http_connect;
+mod new;
 mod parse;
 mod util;
 
