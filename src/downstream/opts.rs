@@ -218,6 +218,7 @@ impl WriteErrorResponse for DefaultResponseWriter {
 
 #[stack_error(derive)]
 pub enum ExtractError {
+    ServiceUnavailable,
     Unauthorized,
     NotFound,
     BadRequest,
@@ -227,6 +228,7 @@ pub enum ExtractError {
 impl ExtractError {
     pub fn response_status(&self) -> StatusCode {
         match self {
+            ExtractError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ExtractError::Unauthorized => StatusCode::UNAUTHORIZED,
             ExtractError::NotFound => StatusCode::NOT_FOUND,
             ExtractError::BadRequest => StatusCode::BAD_REQUEST,
