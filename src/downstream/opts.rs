@@ -218,7 +218,7 @@ pub trait WriteErrorResponse: Send + Sync {
     ) -> impl Future<Output = io::Result<()>> + Send + 'a;
 }
 
-struct DefaultResponseWriter;
+pub(crate) struct DefaultResponseWriter;
 impl WriteErrorResponse for DefaultResponseWriter {
     async fn write_error_response<'a>(
         &'a self,

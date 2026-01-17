@@ -22,7 +22,7 @@ pub use self::opts::{
     ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
 };
 
-mod opts;
+pub(crate) mod opts;
 
 /// Accepts TCP streams and forwards them to upstream iroh destinations.
 #[derive(Clone, Debug)]
@@ -52,11 +52,11 @@ impl DownstreamProxy {
             .write_all(destination.authority.to_connect_request().as_bytes())
             .await?;
         debug!("created tunnel");
-        let response = HttpResponse::read(&mut conn.recv)
+        let (header_len, response) = HttpResponse::read(&mut conn.recv)
             .await
             .map_err(|err| ProxyError::bad_gateway(err))?;
         debug!(?response, "got proxy response");
-        conn.recv.discard(response.header_section_len);
+        conn.recv.discard(header_len);
         if response.status != StatusCode::OK {
             return Err(ProxyError::new(
                 Some(response.status),
@@ -234,7 +234,6 @@ impl ProxyError {
         self.response_status().map(|status| HttpResponse {
             status,
             reason: None,
-            header_section_len: 0,
         })
     }
 

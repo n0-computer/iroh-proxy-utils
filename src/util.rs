@@ -1,5 +1,5 @@
 use iroh::endpoint::SendStream;
-use n0_error::{Result, StdResultExt};
+use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub(crate) use self::prebuffered::Prebuffered;
@@ -12,18 +12,6 @@ pub(crate) fn status_line(status: http::StatusCode, reason: Option<&str>) -> Str
         status.as_u16(),
         reason.or(status.canonical_reason()).unwrap_or("")
     )
-}
-
-pub(crate) async fn write_http_response(
-    writer: &mut (impl AsyncWrite + Unpin),
-    status: http::StatusCode,
-    reason: Option<&str>,
-) -> Result<()> {
-    writer
-        .write_all(status_line(status, reason).as_bytes())
-        .await?;
-    writer.write_all(b"\r\n").await?;
-    Ok(())
 }
 
 pub(crate) async fn write_reqwest_response(
@@ -52,24 +40,23 @@ pub(crate) async fn write_reqwest_response(
 ///
 /// Calls `finish` on the SendStream once done.
 pub(crate) async fn forward_bidi(
-    left_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    left_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
-    right_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    right_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
+    downstream_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
+    downstream_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
+    upstream_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
+    upstream_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
 ) -> Result<()> {
     let (r1, r2) = tokio::join!(
         async {
-            let res = tokio::io::copy(left_recv, right_send).await;
-            right_send.shutdown().await.ok();
+            let res = tokio::io::copy(downstream_recv, upstream_send).await;
+            upstream_send.shutdown().await.ok();
             res
         },
         async {
-            let res = tokio::io::copy(right_recv, left_send).await;
-            left_send.shutdown().await.ok();
+            let res = tokio::io::copy(upstream_recv, downstream_send).await;
+            downstream_send.shutdown().await.ok();
             res
         }
     );
-    r1.anyerr()?;
-    r2.anyerr()?;
+    r1.or(r2).context("Failed while copying stream data")?;
     Ok(())
 }

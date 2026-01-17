@@ -14,9 +14,9 @@ use tokio::net::TcpStream;
 use tracing::{Instrument, debug, instrument, warn};
 
 use crate::{
-    HEADER_SECTION_MAX_LENGTH,
+    HEADER_SECTION_MAX_LENGTH, HttpResponse,
     parse::{HttpProxyRequestKind, HttpRequest},
-    util::{Prebuffered, forward_bidi, write_http_response, write_reqwest_response},
+    util::{Prebuffered, forward_bidi, write_reqwest_response},
 };
 
 mod auth;
@@ -92,28 +92,37 @@ impl UpstreamProxy {
             Ok(()) => debug!("request is authorized, continue"),
             Err(err) => {
                 debug!("request is not authorized, abort");
+                HttpResponse::new(StatusCode::FORBIDDEN)
+                    .write(&mut send)
+                    .await
+                    .ok();
+                send.finish().anyerr()?;
                 return Err(err.into());
             }
         };
 
         match req.kind {
             HttpProxyRequestKind::Tunnel { target: authority } => {
-                // Remove the CONNECT request from the recv stream, because it is not forwarded to the origin server.
+                // Remove the CONNECT request from the recv stream, because it may not be forwarded to the origin server.
                 recv.discard(header_section_len);
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to upstream server: {err:#}");
-                        write_http_response(&mut send, StatusCode::BAD_GATEWAY, None).await?;
+                        HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
+                            .write(&mut send)
+                            .await
+                            .inspect_err(|err| {
+                                warn!("Failed to write error response to downstream: {err:#}")
+                            })
+                            .ok();
                         send.finish().anyerr()?;
                     }
                     Ok(tcp_stream) => {
                         debug!(?authority, "connected to upstream");
-                        write_http_response(
-                            &mut send,
-                            StatusCode::OK,
-                            Some("Connection established"),
-                        )
-                        .await?;
+                        HttpResponse::with_reason(StatusCode::OK, "Connection Established")
+                            .write(&mut send)
+                            .await
+                            .context("Failed to write CONNECT response to downstream")?;
                         let (mut tcp_recv, mut tcp_send) = tcp_stream.into_split();
                         forward_bidi(&mut tcp_recv, &mut tcp_send, &mut recv, &mut send).await?;
                     }
@@ -141,7 +150,7 @@ impl UpstreamProxy {
                 // Forward the request to the upstream server.
                 let res = client
                     .request(method, target)
-                    // TODO: Filter out into_proxy_requestinto_proxy_requestheaders that should not be forwarded to upstream.
+                    // TODO: Filter out hop-to-hop-headers that should not be forwarded to upstream.
                     .headers(req.headers)
                     .body(reqwest::Body::wrap_stream(body))
                     .send()

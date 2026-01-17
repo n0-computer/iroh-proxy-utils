@@ -5,9 +5,12 @@ use http::{
     uri::{Scheme, Uri},
 };
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
-use tokio::io::{self, AsyncRead};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 
-use crate::util::{Prebuffered, status_line};
+use crate::{
+    downstream::{WriteErrorResponse, opts::DefaultResponseWriter},
+    util::{Prebuffered, status_line},
+};
 
 /// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]
@@ -234,10 +237,32 @@ pub struct HttpResponse {
     pub status: StatusCode,
     /// Reason phrase if present.
     pub reason: Option<String>,
-    pub(crate) header_section_len: usize,
 }
 
 impl HttpResponse {
+    pub(crate) fn new(status: StatusCode) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+
+    pub(crate) fn with_reason(status: StatusCode, reason: impl ToString) -> Self {
+        Self {
+            status,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    pub(crate) async fn write(
+        &self,
+        writer: &mut (impl AsyncWrite + Send + Unpin),
+    ) -> io::Result<()> {
+        DefaultResponseWriter
+            .write_error_response(&self, writer)
+            .await
+    }
+
     /// Returns the reason phrase or a canonical reason if available.
     pub fn reason(&self) -> &str {
         self.reason
@@ -254,16 +279,16 @@ impl HttpResponse {
     /// Reads and parses the response status line and header section.
     ///
     /// Note: returns `OutOfMemory` if the header section exceeds the buffer limit.
-    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
 
-            let mut headers = [httparse::EMPTY_HEADER; 0];
+            let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut res = httparse::Response::new(&mut headers);
 
             match res
                 .parse(&reader.buffer())
-                .std_context("Failed to parse HTTP request")?
+                .std_context("Failed to parse HTTP response")?
             {
                 httparse::Status::Partial => continue,
                 httparse::Status::Complete(header_section_len) => {
@@ -271,11 +296,7 @@ impl HttpResponse {
                     let status =
                         StatusCode::from_u16(code).std_context("Invalid response status code")?;
                     let reason = res.reason.map(ToOwned::to_owned);
-                    return Ok(HttpResponse {
-                        status,
-                        reason,
-                        header_section_len,
-                    });
+                    return Ok((header_section_len, HttpResponse { status, reason }));
                 }
             }
         }
