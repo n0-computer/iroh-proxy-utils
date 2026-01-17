@@ -5,7 +5,7 @@ use http::{
     uri::{Scheme, Uri},
 };
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     downstream::{WriteErrorResponse, opts::DefaultResponseWriter},
@@ -230,13 +230,15 @@ impl HttpRequest {
     }
 }
 
-/// Parsed HTTP response status line and header length.
+/// Parsed HTTP response with status, reason, and headers.
 #[derive(derive_more::Debug)]
 pub struct HttpResponse {
     /// Status code from the response line.
     pub status: StatusCode,
     /// Reason phrase if present.
     pub reason: Option<String>,
+    /// Raw header map as received.
+    pub headers: http::HeaderMap<http::HeaderValue>,
 }
 
 impl HttpResponse {
@@ -244,6 +246,7 @@ impl HttpResponse {
         Self {
             status,
             reason: None,
+            headers: http::HeaderMap::new(),
         }
     }
 
@@ -251,6 +254,7 @@ impl HttpResponse {
         Self {
             status,
             reason: Some(reason.to_string()),
+            headers: http::HeaderMap::new(),
         }
     }
 
@@ -258,9 +262,15 @@ impl HttpResponse {
         &self,
         writer: &mut (impl AsyncWrite + Send + Unpin),
     ) -> io::Result<()> {
-        DefaultResponseWriter
-            .write_error_response(&self, writer)
-            .await
+        writer.write_all(self.status_line().as_bytes()).await?;
+        writer.write_all(b"\r\n").await?;
+        for (key, value) in self.headers.iter() {
+            writer.write_all(key.as_str().as_bytes()).await?;
+            writer.write_all(b": ").await?;
+            writer.write_all(value.as_bytes()).await?;
+            writer.write_all(b"\r\n").await?;
+        }
+        Ok(())
     }
 
     /// Returns the reason phrase or a canonical reason if available.
@@ -276,34 +286,58 @@ impl HttpResponse {
         status_line(self.status, self.reason.as_deref())
     }
 
+    /// Parses a response from a buffer and returns `None` when incomplete.
+    pub fn parse(buf: &[u8]) -> Result<Option<Self>> {
+        Ok(Self::parse_with_len(buf)?.map(|(_len, res)| res))
+    }
+
+    /// Parses a response from a buffer and returns `None` when incomplete.
+    ///
+    /// Returns the length of the header section and the response.
+    pub fn parse_with_len(buf: &[u8]) -> Result<Option<(usize, Self)>> {
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut res = httparse::Response::new(&mut headers);
+        match res
+            .parse(buf)
+            .std_context("Failed to parse HTTP response")?
+        {
+            httparse::Status::Partial => Ok(None),
+            httparse::Status::Complete(header_len) => {
+                let code = res.code.context("Missing response status code")?;
+                let status =
+                    StatusCode::from_u16(code).std_context("Invalid response status code")?;
+                let reason = res.reason.map(ToOwned::to_owned);
+                let headers = http::HeaderMap::from_iter(res.headers.iter().flat_map(|h| {
+                    let value = HeaderValue::from_bytes(h.value).ok()?;
+                    let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
+                    Some((name, value))
+                }));
+                Ok(Some((
+                    header_len,
+                    HttpResponse {
+                        status,
+                        reason,
+                        headers,
+                    },
+                )))
+            }
+        }
+    }
+
     /// Reads and parses the response status line and header section.
     ///
     /// Note: returns `OutOfMemory` if the header section exceeds the buffer limit.
     pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
-
-            let mut headers = [httparse::EMPTY_HEADER; 64];
-            let mut res = httparse::Response::new(&mut headers);
-
-            match res
-                .parse(&reader.buffer())
-                .std_context("Failed to parse HTTP response")?
-            {
-                httparse::Status::Partial => continue,
-                httparse::Status::Complete(header_section_len) => {
-                    let code = res.code.context("Missing response status code")?;
-                    let status =
-                        StatusCode::from_u16(code).std_context("Invalid response status code")?;
-                    let reason = res.reason.map(ToOwned::to_owned);
-                    return Ok((header_section_len, HttpResponse { status, reason }));
-                }
+            if let Some(response) = Self::parse_with_len(reader.buffer())? {
+                return Ok(response);
             }
         }
 
         Err(io::Error::new(
             io::ErrorKind::OutOfMemory,
-            "Buffer size limit reached before end of respones header section",
+            "Buffer size limit reached before end of response header section",
         )
         .into())
     }

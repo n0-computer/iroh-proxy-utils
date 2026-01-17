@@ -55,15 +55,16 @@ impl DownstreamProxy {
         let (header_len, response) = HttpResponse::read(&mut conn.recv)
             .await
             .map_err(|err| ProxyError::bad_gateway(err))?;
-        debug!(?response, "got proxy response");
+        debug!(?response, ?header_len, "got proxy response");
         conn.recv.discard(header_len);
         if response.status != StatusCode::OK {
-            return Err(ProxyError::new(
+            Err(ProxyError::new(
                 Some(response.status),
                 anyerr!("Upstream gateway returned error response"),
-            ));
+            ))
+        } else {
+            Ok(conn)
         }
-        Ok(conn)
     }
 
     /// Accepts TCP connections from the listener and forwards each in a new task.
@@ -231,10 +232,7 @@ impl ProxyError {
     }
 
     fn to_response(&self) -> Option<HttpResponse> {
-        self.response_status().map(|status| HttpResponse {
-            status,
-            reason: None,
-        })
+        self.response_status().map(HttpResponse::new)
     }
 
     fn bad_request(source: impl Into<AnyError>) -> Self {
