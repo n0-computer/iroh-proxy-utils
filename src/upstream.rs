@@ -46,6 +46,7 @@ impl ProtocolHandler for UpstreamProxy {
 }
 
 impl UpstreamProxy {
+    /// Creates a new upstream proxy with the provided authorization handler.
     pub fn new(auth: impl AuthHandler + 'static) -> Result<Self> {
         Ok(Self {
             auth: DynAuthHandler::new_arc(auth),
@@ -80,8 +81,7 @@ impl UpstreamProxy {
         recv: RecvStream,
     ) -> Result<()> {
         let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
-        let req = HttpRequest::read(&mut recv).await?;
-        let header_section_len = req.header_section_len;
+        let (header_section_len, req) = HttpRequest::read(&mut recv).await?;
 
         debug!(?req, "incoming request");
         let req = req

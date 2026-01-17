@@ -9,14 +9,16 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 use crate::{
+    HttpOriginRequest, HttpProxyRequest,
     downstream::{EndpointAuthority, ProxyError},
-    parse::{HttpRequest, HttpResponse},
+    parse::HttpResponse,
 };
 
+/// Options for the downstream connection pool.
 #[derive(Debug, Clone)]
 pub struct PoolOpts {
-    connect_timeout: Duration,
-    idle_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub idle_timeout: Duration,
 }
 
 impl Default for PoolOpts {
@@ -38,48 +40,50 @@ impl From<PoolOpts> for connection_pool::Options {
     }
 }
 
+/// Determines how the proxy deals with incoming TCP connections.
 #[derive(derive_more::Debug, Clone)]
-pub struct ProxyOpts {
-    /// Forward-proxy mode: Accepts CONNECT or forward-proxy requests.
+pub enum ProxyMode {
+    /// TCP mode blindly forwards all incoming TCP connections over a tunnel to a fixed remote authority.
+    Tcp(EndpointAuthority),
+    /// HTTP mode reads the header section of the HTTP request on incoming TCP connections, and thus
+    /// can use the request data to decide over the destination.
+    Http(HttpProxyOpts),
+}
+
+/// Policy for handling forward and reverse proxy requests.
+#[derive(derive_more::Debug, Default, Clone)]
+pub struct HttpProxyOpts {
+    /// Forward-proxy mode for CONNECT authority-form and absolute-form requests.
     forward: Option<ForwardProxyMode>,
-    /// Reverse-proxy mode: Accepts regular origin HTTP requests.
+    /// Reverse-proxy mode for origin-form requests.
     reverse: Option<ReverseProxyMode>,
     #[debug("{:?}", response_writer.as_ref().map(|_| "DynWriteErrorResponse"))]
     response_writer: Option<Arc<DynWriteErrorResponse<'static>>>,
 }
 
-impl ProxyOpts {
-    /// Forward-proxy mode: Accepts CONNECT or forward-proxy requests.
-    pub fn forward_only(mode: impl Into<ForwardProxyMode>) -> Self {
-        Self {
-            forward: Some(mode.into()),
-            reverse: None,
-            response_writer: None,
-        }
+impl HttpProxyOpts {
+    /// Enables forward-proxy handling for CONNECT authority-form and absolute-form requests.
+    ///
+    /// Note: origin-form requests will be rejected by the proxy with
+    /// `400 Bad Request` when this is the only mode configured.
+    pub fn forward(mut self, mode: impl Into<ForwardProxyMode>) -> Self {
+        self.forward = Some(mode.into());
+        self
     }
 
-    /// Reverse-proxy mode: Accepts regular origin HTTP requests.
-    pub fn reverse_only(mode: impl Into<ReverseProxyMode>) -> Self {
-        Self {
-            forward: None,
-            reverse: Some(mode.into()),
-            response_writer: None,
-        }
+    /// Enables reverse-proxy handling for origin-form requests.
+    ///
+    /// Note: CONNECT and absolute-form requests will be rejected by the
+    /// proxy with `400 Bad Request` when this is the only mode configured.
+    pub fn reverse(mut self, mode: impl Into<ReverseProxyMode>) -> Self {
+        self.reverse = Some(mode.into());
+        self
     }
 
-    /// Accepts both regular origin HTTP requests and CONNECT or forward-proxy requests.
-    pub fn forward_and_reverse(
-        forward: impl Into<ForwardProxyMode>,
-        reverse: impl Into<ReverseProxyMode>,
-    ) -> Self {
-        Self {
-            forward: Some(forward.into()),
-            reverse: Some(reverse.into()),
-            response_writer: None,
-        }
-    }
-
-    pub fn with_error_response_writer(mut self, writer: impl WriteErrorResponse + 'static) -> Self {
+    /// Installs a custom error response writer for downstream-facing responses.
+    ///
+    /// Note: if not set, a minimal `text/plain` response is emitted.
+    pub fn error_response_writer(mut self, writer: impl WriteErrorResponse + 'static) -> Self {
         self.response_writer = Some(DynWriteErrorResponse::new_arc(writer));
         self
     }
@@ -118,50 +122,62 @@ impl ProxyOpts {
     }
 }
 
+/// Forward-proxy routing for CONNECT authority-form and absolute-form requests.
 #[derive(derive_more::Debug, Clone)]
 pub enum ForwardProxyMode {
+    /// Always forward to the fixed endpoint.
     Static(EndpointId),
-    #[debug("DynExtractEndpoint")]
-    Dynamic(Arc<DynExtractEndpoint<'static>>),
+    /// Resolve the endpoint dynamically from the request.
+    #[debug("DynForwardProxyResolver")]
+    Dynamic(Arc<DynForwardProxyResolver<'static>>),
 }
 
 impl ForwardProxyMode {
-    pub async fn extact_endpoint(&self, req: &HttpRequest) -> Result<EndpointId, ExtractError> {
+    /// Resolves the destination endpoint for a proxy request.
+    ///
+    /// Note: extractor failures map to HTTP error status codes via `ExtractError`.
+    pub async fn destination(&self, req: &HttpProxyRequest) -> Result<EndpointId, ExtractError> {
         match self {
             Self::Static(destination) => Ok(destination.clone()),
-            Self::Dynamic(extractor) => extractor.extract_endpoint(req).await,
+            Self::Dynamic(extractor) => extractor.destination(req).await,
         }
     }
 }
 
-impl<T: ExtractEndpoint + 'static> From<T> for ForwardProxyMode {
+impl<T: ForwardProxyResolver + 'static> From<T> for ForwardProxyMode {
     fn from(value: T) -> Self {
-        Self::Dynamic(DynExtractEndpoint::new_arc(value))
+        Self::Dynamic(DynForwardProxyResolver::new_arc(value))
     }
 }
 
+/// Reverse-proxy routing for origin-form requests.
 #[derive(derive_more::Debug, Clone)]
 pub enum ReverseProxyMode {
+    /// Always forward to the fixed endpoint and authority.
     Static(EndpointAuthority),
-    #[debug("DynExtractEndpointAuthority")]
-    Dynamic(Arc<DynExtractEndpointAuthority<'static>>),
+    /// Resolve the endpoint and authority dynamically from the request.
+    #[debug("DynReverseProxyResolver")]
+    Dynamic(Arc<DynReverseProxyResolver<'static>>),
 }
 
 impl ReverseProxyMode {
-    pub async fn extact_endpoint_authority(
+    /// Resolves the destination endpoint and authority for an origin-form request.
+    ///
+    /// Note: extractor failures map to HTTP error status codes via `ExtractError`.
+    pub async fn destination(
         &self,
-        req: &HttpRequest,
+        req: &HttpOriginRequest,
     ) -> Result<EndpointAuthority, ExtractError> {
         match self {
             Self::Static(destination) => Ok(destination.clone()),
-            Self::Dynamic(extractor) => extractor.extract_endpoint_authority(req).await,
+            Self::Dynamic(extractor) => extractor.destination(req).await,
         }
     }
 }
 
-impl<T: ExtractEndpointAuthority + 'static> From<T> for ReverseProxyMode {
+impl<T: ReverseProxyResolver + 'static> From<T> for ReverseProxyMode {
     fn from(value: T) -> Self {
-        Self::Dynamic(DynExtractEndpointAuthority::new_arc(value))
+        Self::Dynamic(DynReverseProxyResolver::new_arc(value))
     }
 }
 
@@ -171,24 +187,30 @@ impl From<EndpointAuthority> for ReverseProxyMode {
     }
 }
 
-#[dynosaur(DynExtractEndpoint = dyn(box) ExtractEndpoint)]
-pub trait ExtractEndpoint: Send + Sync {
-    fn extract_endpoint<'a>(
+#[dynosaur(DynForwardProxyResolver = dyn(box) ForwardProxyResolver)]
+/// Extracts an iroh endpoint from a proxy request.
+pub trait ForwardProxyResolver: Send + Sync {
+    /// Returns the destination endpoint or an application error.
+    fn destination<'a>(
         &'a self,
-        req: &'a HttpRequest,
+        req: &'a HttpProxyRequest,
     ) -> impl Future<Output = Result<EndpointId, ExtractError>> + Send + 'a;
 }
 
-#[dynosaur(DynExtractEndpointAuthority = dyn(box) ExtractEndpointAuthority)]
-pub trait ExtractEndpointAuthority: Send + Sync {
-    fn extract_endpoint_authority<'a>(
+#[dynosaur(DynReverseProxyResolver = dyn(box) ReverseProxyResolver)]
+/// Extracts an iroh endpoint and authority from an origin-form request.
+pub trait ReverseProxyResolver: Send + Sync {
+    /// Returns the destination endpoint and authority or an application error.
+    fn destination<'a>(
         &'a self,
-        req: &'a HttpRequest,
+        req: &'a HttpOriginRequest,
     ) -> impl Future<Output = Result<EndpointAuthority, ExtractError>> + Send + 'a;
 }
 
 #[dynosaur(DynWriteErrorResponse = dyn(box) WriteErrorResponse)]
+/// Writes an HTTP error response to a downstream TCP stream.
 pub trait WriteErrorResponse: Send + Sync {
+    /// Emits a complete HTTP/1.x response for a proxy error.
     fn write_error_response<'a>(
         &'a self,
         res: &'a HttpResponse,
@@ -216,16 +238,23 @@ impl WriteErrorResponse for DefaultResponseWriter {
     }
 }
 
+/// Error classification for endpoint extraction and authorization.
 #[stack_error(derive)]
 pub enum ExtractError {
+    /// A required service is not available.
     ServiceUnavailable,
+    /// Authentication is required or failed.
     Unauthorized,
+    /// The requested resource does not exist.
     NotFound,
+    /// The request is malformed or unsupported.
     BadRequest,
+    /// An internal error occurred during extraction.
     InternalError,
 }
 
 impl ExtractError {
+    /// Returns the corresponding HTTP status code.
     pub fn response_status(&self) -> StatusCode {
         match self {
             ExtractError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,

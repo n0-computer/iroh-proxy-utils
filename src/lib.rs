@@ -1,18 +1,23 @@
+//! Utilities for HTTP proxying over iroh connections.
+
+/// Downstream proxying from TCP clients to iroh endpoints.
 pub mod downstream;
 mod parse;
+/// Upstream proxying from iroh streams to TCP origins.
 pub mod upstream;
 mod util;
 
 pub use parse::{
-    Authority, HttpProxyRequest, HttpProxyRequestKind, HttpRequest, HttpRequestKind, HttpResponse,
+    Authority, HttpOriginRequest, HttpProxyRequest, HttpProxyRequestKind, HttpRequest,
+    HttpRequestKind, HttpResponse,
 };
 
 /// How much data to read for the CONNECT handshake before it's considered invalid.
 pub(crate) const HEADER_SECTION_MAX_LENGTH: usize = 8192;
 
-/// HTTP header for iroh addressing info
+/// HTTP header used to carry iroh destination metadata.
 pub const IROH_DESTINATION_HEADER: &str = "Iroh-Destination";
-/// The ALPN that we're using for iroh connections
+/// ALPN identifier for the iroh HTTP proxy protocol.
 pub const ALPN: &[u8] = b"iroh-http-proxy";
 
 #[cfg(test)]
@@ -25,7 +30,7 @@ mod tests {
 
     use crate::{
         ALPN,
-        downstream::{DownstreamProxy, ForwardProxyMode, ProxyOpts},
+        downstream::{DownstreamProxy, ForwardProxyMode, HttpProxyOpts, ProxyMode},
         upstream::{AcceptAll, UpstreamProxy},
     };
 
@@ -45,7 +50,8 @@ mod tests {
         let proxy_id = proxy_router.endpoint().id();
         println!("upstream: {proxy_id}");
 
-        let gw_mode = ProxyOpts::forward_only(ForwardProxyMode::Static(proxy_id));
+        let gw_mode =
+            ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(proxy_id)));
         let gw_task =
             tokio::spawn(async move { gw_proxy.forward_tcp_listener(gw_listener, gw_mode).await });
 

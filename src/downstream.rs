@@ -13,32 +13,36 @@ use tracing::{Instrument, debug, error_span, warn};
 
 use crate::{
     ALPN, Authority, HEADER_SECTION_MAX_LENGTH,
-    parse::{HttpRequest, HttpRequestKind, HttpResponse},
+    parse::{HttpRequest, HttpResponse},
     util::{Prebuffered, forward_bidi},
 };
 
 pub use self::opts::{
-    ExtractEndpoint, ExtractEndpointAuthority, ExtractError, ForwardProxyMode, PoolOpts, ProxyOpts,
-    ReverseProxyMode, WriteErrorResponse,
+    ExtractError, ForwardProxyMode, ForwardProxyResolver, HttpProxyOpts, PoolOpts, ProxyMode,
+    ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
 };
 
 mod opts;
 
-/// The `DownstreamProxy` accepts TCP streams and forwards them to upstream iroh destinations.
+/// Accepts TCP streams and forwards them to upstream iroh destinations.
 #[derive(Clone, Debug)]
 pub struct DownstreamProxy {
     pool: ConnectionPool,
 }
 
 impl DownstreamProxy {
+    /// Creates a downstream proxy with the given endpoint and pool options.
     pub fn new(endpoint: Endpoint, opts: PoolOpts) -> Self {
         let pool = ConnectionPool::new(endpoint, ALPN, opts.into());
         Self { pool }
     }
 
+    /// Opens a CONNECT tunnel to the upstream proxy and returns the client streams.
+    ///
+    /// Note: any non-`200 OK` response from upstream is returned as a `ProxyError`.
     pub async fn create_tunnel(
         &self,
-        destination: EndpointAuthority,
+        destination: &EndpointAuthority,
     ) -> Result<TunnelClientStreams, ProxyError> {
         let mut conn = self
             .connect(destination.endpoint_id)
@@ -62,7 +66,10 @@ impl DownstreamProxy {
         Ok(conn)
     }
 
-    pub async fn forward_tcp_listener(&self, listener: TcpListener, mode: ProxyOpts) -> Result<()> {
+    /// Accepts TCP connections from the listener and forwards each in a new task.
+    ///
+    /// Note: this runs indefinitely until the listener errors or the task is cancelled.
+    pub async fn forward_tcp_listener(&self, listener: TcpListener, mode: ProxyMode) -> Result<()> {
         let cancel_token = CancellationToken::new();
         let _cancel_guard = cancel_token.clone().drop_guard();
         loop {
@@ -80,11 +87,17 @@ impl DownstreamProxy {
         }
     }
 
-    pub async fn forward_tcp_stream(&self, mut conn: TcpStream, opts: &ProxyOpts) -> Result<()> {
-        if let Err(err) = self.forward_tcp_stream_inner(&mut conn, opts).await {
+    /// Forwards a single TCP stream based on the first HTTP request.
+    ///
+    /// Note: only the initial request is parsed; subsequent bytes are streamed as-is.
+    pub async fn forward_tcp_stream(&self, mut conn: TcpStream, mode: &ProxyMode) -> Result<()> {
+        if let Err(err) = self.forward_tcp_stream_inner(&mut conn, mode).await {
             warn!("Forwarding TCP stream closed with error: {err:#}");
-            if let Some(response) = err.to_response() {
-                let _ = opts.write_error_response(&response, &mut conn).await;
+            // If this is a HTTP proxy, write an error response if the error is a proxy error.
+            if let ProxyMode::Http(opts) = mode {
+                if let Some(response) = err.to_response() {
+                    let _ = opts.write_error_response(&response, &mut conn).await;
+                }
             }
             Err(err.into())
         } else {
@@ -96,28 +109,41 @@ impl DownstreamProxy {
     async fn forward_tcp_stream_inner(
         &self,
         conn: &mut TcpStream,
-        opts: &ProxyOpts,
+        mode: &ProxyMode,
     ) -> Result<(), ProxyError> {
         let (tcp_recv, mut tcp_send) = conn.split();
-        let mut tcp_recv = Prebuffered::new(tcp_recv, HEADER_SECTION_MAX_LENGTH);
-        let request = HttpRequest::read(&mut tcp_recv)
-            .await
-            .map_err(|err| ProxyError::bad_request(err))?;
-        debug!(?request, "read request");
-        let mut conn = match &request.kind {
-            HttpRequestKind::Proxy(_) => {
-                let forward = opts.as_forward()?;
-                let endpoint_id = forward.extact_endpoint(&request).await?;
-                self.connect(endpoint_id)
+
+        // We only need to prebuffer for HTTP mode.
+        let prebuffer_max_len = match mode {
+            ProxyMode::Tcp(_) => 0,
+            ProxyMode::Http(_) => HEADER_SECTION_MAX_LENGTH,
+        };
+        let mut tcp_recv = Prebuffered::new(tcp_recv, prebuffer_max_len);
+
+        let mut conn = match mode {
+            ProxyMode::Tcp(destination) => self.create_tunnel(destination).await?,
+            ProxyMode::Http(opts) => {
+                let (_header_len, request) = HttpRequest::read(&mut tcp_recv)
                     .await
-                    .map_err(|err| ProxyError::gateway_timeout(err))?
-            }
-            HttpRequestKind::Origin { .. } => {
-                let reverse = opts.as_reverse()?;
-                let destination = reverse.extact_endpoint_authority(&request).await?;
-                self.create_tunnel(destination).await?
+                    .map_err(|err| ProxyError::bad_request(err))?;
+                debug!(?request, "read request");
+                match &request {
+                    HttpRequest::Forward(request) => {
+                        let forward = opts.as_forward()?;
+                        let endpoint_id = forward.destination(&request).await?;
+                        self.connect(endpoint_id)
+                            .await
+                            .map_err(|err| ProxyError::gateway_timeout(err))?
+                    }
+                    HttpRequest::Origin(request) => {
+                        let reverse = opts.as_reverse()?;
+                        let destination = reverse.destination(request).await?;
+                        self.create_tunnel(&destination).await?
+                    }
+                }
             }
         };
+
         debug!("connected to remote");
 
         forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
@@ -142,19 +168,27 @@ impl DownstreamProxy {
     }
 }
 
+/// Bidirectional streams for a single iroh tunnel.
 pub struct TunnelClientStreams {
+    /// QUIC send stream toward the upstream proxy.
     pub send: SendStream,
+    /// QUIC recv stream from the upstream proxy.
     pub recv: Prebuffered<RecvStream>,
+    /// Connection handle kept alive for the tunnel lifetime.
     pub conn: ConnectionRef,
 }
 
 #[derive(Debug, Clone)]
+/// Endpoint identifier paired with the target authority.
 pub struct EndpointAuthority {
+    /// Destination iroh endpoint identifier.
     pub endpoint_id: EndpointId,
+    /// Target authority for the CONNECT request.
     pub authority: Authority,
 }
 
 impl EndpointAuthority {
+    /// Constructs an `EndpointAuthority` from its components.
     pub fn new(endpoint_id: EndpointId, authority: Authority) -> Self {
         Self {
             endpoint_id,
@@ -163,6 +197,7 @@ impl EndpointAuthority {
     }
 }
 
+/// Error type for downstream proxy failures.
 #[stack_error(add_meta, derive)]
 pub struct ProxyError {
     response_status: Option<StatusCode>,
@@ -190,6 +225,7 @@ impl From<iroh::endpoint::WriteError> for ProxyError {
 }
 
 impl ProxyError {
+    /// Returns the HTTP status code to surface to the client, if any.
     pub fn response_status(&self) -> Option<StatusCode> {
         self.response_status
     }

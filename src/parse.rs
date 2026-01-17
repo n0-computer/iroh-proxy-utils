@@ -9,10 +9,13 @@ use tokio::io::{self, AsyncRead};
 
 use crate::util::{Prebuffered, status_line};
 
+/// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]
 #[display("{host}:{port}")]
 pub struct Authority {
+    /// Hostname or IP literal without scheme.
     pub host: String,
+    /// Port number in host byte order.
     pub port: u16,
 }
 
@@ -24,6 +27,9 @@ impl FromStr for Authority {
 }
 
 impl Authority {
+    /// Parses an authority-form URI with no scheme and no path.
+    ///
+    /// Note: the URI must include a port.
     pub fn from_authority_uri(uri: &Uri) -> Result<Self> {
         ensure_any!(uri.scheme().is_none(), "Expected URI without scheme");
         ensure_any!(uri.path_and_query().is_none(), "Expected URI without path");
@@ -36,6 +42,9 @@ impl Authority {
         })
     }
 
+    /// Parses an absolute-form URI and infers the port from the scheme.
+    ///
+    /// Note: if no port is present, only `http` and `https` schemes are accepted.
     pub fn from_absolute_uri(uri: &Uri) -> Result<Self> {
         let authority = uri.authority().context("Expected URI with authority")?;
         let host = authority.host();
@@ -53,10 +62,12 @@ impl Authority {
         })
     }
 
+    /// Parses an authority-form request target from a string.
     pub fn from_authority_str(s: &str) -> Result<Self> {
         Self::from_authority_uri(&Uri::from_str(s).std_context("Invalid authority string")?)
     }
 
+    /// Parses an absolute-form request target from a string.
     pub fn from_absolute_uri_str(s: &str) -> Result<Self> {
         Self::from_absolute_uri(&Uri::from_str(s).std_context("Invalid authority string")?)
     }
@@ -72,18 +83,21 @@ impl Authority {
     }
 }
 
+/// Parsed request target classification per RFC 9110.
 #[derive(Debug)]
 pub enum HttpRequestKind {
-    /// Tunnel or forward-proxy request.
+    /// CONNECT authority-form or absolute-form proxy request.
     Proxy(HttpProxyRequestKind),
     /// Direct origin request with origin-form request target.
     Origin {
+        /// Origin-form path component.
         path: String,
-        host: Option<String>,
+        /// HTTP method from the request line.
         method: Method,
     },
 }
 
+/// Proxy request targets per RFC 9110.
 #[derive(Debug)]
 pub enum HttpProxyRequestKind {
     /// Tunnel CONNECT request with authority-form request target.
@@ -92,24 +106,46 @@ pub enum HttpProxyRequestKind {
     Absolute { target: String, method: Method },
 }
 
+/// Parsed HTTP proxy request with headers.
 #[derive(derive_more::Debug)]
 pub struct HttpProxyRequest {
+    /// Parsed proxy request target.
     pub kind: HttpProxyRequestKind,
+    /// Raw header map as received.
     pub headers: http::HeaderMap<http::HeaderValue>,
 }
 
-#[derive(derive_more::Debug)]
-pub struct HttpRequest {
-    pub kind: HttpRequestKind,
+/// Parsed HTTP request with headers and request target classification.
+#[derive(Debug)]
+pub enum HttpRequest {
+    Forward(HttpProxyRequest),
+    Origin(HttpOriginRequest),
+}
+
+#[derive(Debug)]
+pub struct HttpOriginRequest {
+    /// Origin-form path component.
+    pub path: String,
+    /// HTTP method from the request line.
+    pub method: Method,
+    /// Raw header map as received.
     pub headers: http::HeaderMap<http::HeaderValue>,
-    pub(crate) header_section_len: usize,
+}
+
+impl HttpOriginRequest {
+    pub fn host(&self) -> Option<&str> {
+        self.headers.get("host").and_then(|x| x.to_str().ok())
+    }
 }
 
 impl HttpRequest {
-    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+    /// Reads and parses the request line and header section.
+    ///
+    /// Returns the length of the header section and the request.
+    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
-            if let Some(request) = Self::parse(reader.buffer())? {
+            if let Some(request) = Self::parse_with_len(reader.buffer())? {
                 return Ok(request);
             }
         }
@@ -120,18 +156,28 @@ impl HttpRequest {
         .into())
     }
 
+    /// Parses a request from a buffer and returns `None` when incomplete.
+    ///
+    /// Returns the length of the header section and the request.
     pub fn parse(buf: &[u8]) -> Result<Option<Self>> {
+        Ok(Self::parse_with_len(buf)?.map(|(_len, req)| req))
+    }
+
+    /// Parses a request from a buffer and returns `None` when incomplete.
+    ///
+    /// Returns the length of the header section and the request.
+    pub fn parse_with_len(buf: &[u8]) -> Result<Option<(usize, Self)>> {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(&buf[..]).std_context("Invalid HTTP request")? {
             httparse::Status::Partial => Ok(None),
-            httparse::Status::Complete(body_offset) => {
-                Self::from_request(req, body_offset).map(Some)
+            httparse::Status::Complete(header_len) => {
+                Self::from_request(req).map(|req| Some((header_len, req)))
             }
         }
     }
 
-    fn from_request<'a>(req: httparse::Request, header_section_len: usize) -> Result<Self> {
+    fn from_request<'a>(req: httparse::Request) -> Result<Self> {
         let method_str = req.method.context("Missing HTTP method")?;
         let method = method_str.parse().std_context("Invalid HTTP method")?;
         let path = req.path.context("Missing request target")?;
@@ -141,57 +187,58 @@ impl HttpRequest {
             let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
             Some((name, value))
         }));
-        let kind = match method {
+        let request = match method {
             Method::CONNECT => {
                 let authority = Authority::from_authority_uri(&uri)?;
-                HttpRequestKind::Proxy(HttpProxyRequestKind::Tunnel { target: authority })
+                Self::Forward(HttpProxyRequest {
+                    kind: HttpProxyRequestKind::Tunnel { target: authority },
+                    headers,
+                })
             }
             _ => {
                 if uri.scheme().is_some() {
-                    HttpRequestKind::Proxy(HttpProxyRequestKind::Absolute {
-                        target: path.to_string(),
-                        method,
+                    Self::Forward(HttpProxyRequest {
+                        kind: HttpProxyRequestKind::Absolute {
+                            target: path.to_string(),
+                            method,
+                        },
+                        headers,
                     })
                 } else {
-                    let host = headers
-                        .get("host")
-                        .and_then(|x| Some(x.to_str().ok()?.to_string()));
-                    HttpRequestKind::Origin {
+                    Self::Origin(HttpOriginRequest {
                         path: path.to_string(),
-                        host,
                         method,
-                    }
+                        headers,
+                    })
                 }
             }
         };
-        Ok(Self {
-            kind,
-            headers,
-            header_section_len,
-        })
+        Ok(request)
     }
 
+    /// Converts to a proxy request when the target is authority-form or absolute-form.
+    ///
+    /// Note: origin-form requests return an error.
     pub fn try_into_proxy_request(self) -> Result<HttpProxyRequest> {
-        match self.kind {
-            HttpRequestKind::Proxy(kind) => Ok(HttpProxyRequest {
-                kind,
-                headers: self.headers,
-            }),
-            HttpRequestKind::Origin { .. } => {
-                Err(anyerr!("Request is origin-form and not a proxy request"))
-            }
+        match self {
+            Self::Forward(inner) => Ok(inner),
+            Self::Origin(_) => Err(anyerr!("Request is origin-form and not a proxy request")),
         }
     }
 }
 
+/// Parsed HTTP response status line and header length.
 #[derive(derive_more::Debug)]
 pub struct HttpResponse {
+    /// Status code from the response line.
     pub status: StatusCode,
+    /// Reason phrase if present.
     pub reason: Option<String>,
     pub(crate) header_section_len: usize,
 }
 
 impl HttpResponse {
+    /// Returns the reason phrase or a canonical reason if available.
     pub fn reason(&self) -> &str {
         self.reason
             .as_deref()
@@ -199,10 +246,14 @@ impl HttpResponse {
             .unwrap_or("")
     }
 
+    /// Formats a status line suitable for an HTTP/1.x response.
     pub fn status_line(&self) -> String {
         status_line(self.status, self.reason.as_deref())
     }
 
+    /// Reads and parses the response status line and header section.
+    ///
+    /// Note: returns `OutOfMemory` if the header section exceeds the buffer limit.
     pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
         while !reader.is_full() {
             reader.buffer_more().await?;
