@@ -7,10 +7,7 @@ use http::{
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    downstream::{WriteErrorResponse, opts::DefaultResponseWriter},
-    util::{Prebuffered, status_line},
-};
+use crate::util::{Prebuffered, status_line};
 
 /// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]

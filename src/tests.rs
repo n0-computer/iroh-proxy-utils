@@ -20,6 +20,19 @@ use crate::{
     upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
 };
 
+// TODO: Untested edge cases:
+// - HTTP methods other than GET (POST, PUT, DELETE with request bodies)
+// - Large request/response bodies
+// - Chunked transfer encoding
+// - HTTP/1.0 clients
+// - Keep-alive connection reuse
+// - Connection timeouts and upstream failures
+// - Invalid/malformed HTTP requests
+// - Header size limits (exceeding HEADER_SECTION_MAX_LENGTH)
+// - Multiple concurrent requests through same proxy
+// - Upstream returning non-2xx status codes
+// - Request/response header preservation
+
 // -- Test helpers --
 
 /// Spawns an upstream iroh proxy that accepts all requests.
@@ -75,7 +88,6 @@ async fn spawn_echo_server() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
 async fn read_http_response(stream: &mut TcpStream) -> Result<(u16, String)> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
-    println!("RESPONSE {:#}", String::from_utf8_lossy(&buf));
 
     let (header_len, response) = HttpResponse::parse_with_len(&buf)?
         .ok_or_else(|| n0_error::anyerr!("Incomplete HTTP response"))?;
@@ -112,7 +124,6 @@ impl ReverseProxyResolver for SubdomainRouter {
     ) -> Result<EndpointAuthority, ExtractError> {
         let host = req.host().ok_or(ExtractError::BadRequest)?;
         let subdomain = host.split('.').next().ok_or(ExtractError::BadRequest)?;
-        println!("host {host} subdomain {subdomain} routes {:?}", self.routes);
         self.routes
             .get(subdomain)
             .cloned()
@@ -290,7 +301,7 @@ async fn test_http_forward_connect() -> Result {
 #[traced_test]
 async fn test_http_reverse() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
-    let (origin_addr, origin_task) = spawn_origin_server("origin").await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
     let destination = EndpointAuthority::new(
         upstream_id,
@@ -298,25 +309,20 @@ async fn test_http_reverse() -> Result {
     );
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
-    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
-    // Send origin-form request directly (no proxy configuration in client)
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream
-        .write_all(b"GET /reverse/path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
-    assert!(response.contains("200 OK"), "Response: {response}");
-    assert!(
-        response.contains("origin GET /reverse/path"),
-        "Response: {response}"
-    );
+    // Direct request to reverse proxy (no proxy config - sends origin-form)
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("http://{proxy_addr}/reverse/path"))
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, "origin GET /reverse/path");
 
     upstream_router.shutdown().await.anyerr()?;
-    proxy_task.abort();
-    origin_task.abort();
     Ok(())
 }
 
@@ -375,28 +381,32 @@ async fn test_http_forward_dynamic_missing_header() -> Result {
     let mode = ProxyMode::Http(HttpProxyOpts::default().forward(HeaderResolver));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
-    // Send request without Iroh-Destination header
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream
-        .write_all(b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-        .await?;
-
-    let (status, _body) = read_http_response(&mut stream).await?;
-    assert_eq!(status, 400);
+    // Request without Iroh-Destination header should fail
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+        .build()
+        .anyerr()?;
+    let res = client
+        .get("http://example.com/path")
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     Ok(())
 }
 
 /// HTTP reverse proxy with dynamic subdomain-based routing.
+/// Note: Uses manual TCP to control Host header precisely (reqwest may override it).
 #[tokio::test]
 #[traced_test]
 async fn test_http_reverse_dynamic() -> Result {
     // Two separate upstream proxies with labeled origin servers
     let (upstream1_router, upstream1_id) = spawn_upstream_proxy().await?;
-    let (origin1_addr, origin1_task) = spawn_origin_server("server1").await?;
+    let (origin1_addr, _origin1_task) = spawn_origin_server("server1").await?;
 
     let (upstream2_router, upstream2_id) = spawn_upstream_proxy().await?;
-    let (origin2_addr, origin2_task) = spawn_origin_server("server2").await?;
+    let (origin2_addr, _origin2_task) = spawn_origin_server("server2").await?;
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -415,9 +425,9 @@ async fn test_http_reverse_dynamic() -> Result {
     );
 
     let mode = ProxyMode::Http(HttpProxyOpts::default().reverse(SubdomainRouter { routes }));
-    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
-    // Request to proxy1.example.com -> should hit server1
+    // Request with Host: proxy1.example.com -> should hit server1
     let mut stream1 = TcpStream::connect(proxy_addr).await?;
     stream1
         .write_all(b"GET /path HTTP/1.1\r\nHost: proxy1.example.com\r\nConnection: close\r\n\r\n")
@@ -426,7 +436,7 @@ async fn test_http_reverse_dynamic() -> Result {
     assert_eq!(status1, 200);
     assert_eq!(body1, "server1 GET /path");
 
-    // Request to proxy2.example.com -> should hit server2
+    // Request with Host: proxy2.example.com -> should hit server2
     let mut stream2 = TcpStream::connect(proxy_addr).await?;
     stream2
         .write_all(b"GET /path HTTP/1.1\r\nHost: proxy2.example.com\r\nConnection: close\r\n\r\n")
@@ -437,9 +447,6 @@ async fn test_http_reverse_dynamic() -> Result {
 
     upstream1_router.shutdown().await.anyerr()?;
     upstream2_router.shutdown().await.anyerr()?;
-    proxy_task.abort();
-    origin1_task.abort();
-    origin2_task.abort();
     Ok(())
 }
 
@@ -449,18 +456,17 @@ async fn test_http_reverse_dynamic() -> Result {
 async fn test_http_reverse_dynamic_unknown_subdomain() -> Result {
     let routes = HashMap::new(); // Empty routes
     let mode = ProxyMode::Http(HttpProxyOpts::default().reverse(SubdomainRouter { routes }));
-    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
-    // Request with unknown subdomain
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream
-        .write_all(b"GET /path HTTP/1.1\r\nHost: unknown.example.com\r\nConnection: close\r\n\r\n")
-        .await?;
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("http://{proxy_addr}/path"))
+        .header("Host", "unknown.example.com")
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-    let (status, _body) = read_http_response(&mut stream).await?;
-    assert_eq!(status, 404);
-
-    proxy_task.abort();
     Ok(())
 }
 
