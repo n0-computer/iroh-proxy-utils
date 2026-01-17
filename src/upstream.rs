@@ -132,6 +132,9 @@ impl UpstreamProxy {
             HttpProxyRequestKind::Absolute { method, target } => {
                 let client = reqwest::Client::new();
 
+                // Remove the request headers from the buffer, leaving only the body.
+                recv.discard(header_section_len);
+
                 // Convert the Prebuffered<RecvStream> into a stream of Result<Bytes, std::io::Error>
                 let (init, recv) = recv.into_parts();
                 let body = stream::unfold((Some(init), recv), async |(mut init, mut recv)| {

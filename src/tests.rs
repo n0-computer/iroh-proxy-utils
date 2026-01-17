@@ -21,17 +21,15 @@ use crate::{
 };
 
 // TODO: Untested edge cases:
-// - HTTP methods other than GET (POST, PUT, DELETE with request bodies)
-// - Large request/response bodies
 // - Chunked transfer encoding
 // - HTTP/1.0 clients
 // - Keep-alive connection reuse
-// - Connection timeouts and upstream failures
-// - Invalid/malformed HTTP requests
+// - Connection timeouts
 // - Header size limits (exceeding HEADER_SECTION_MAX_LENGTH)
-// - Multiple concurrent requests through same proxy
 // - Upstream returning non-2xx status codes
 // - Request/response header preservation
+// - WebSocket upgrade through CONNECT tunnel
+// - Slow/streaming request/response bodies
 
 // -- Test helpers --
 
@@ -595,10 +593,323 @@ async fn test_upstream_auth_authority() -> Result {
     Ok(())
 }
 
+// -- Edge case tests --
+
+/// POST request with body is forwarded correctly through absolute-form proxy.
+#[tokio::test]
+#[traced_test]
+async fn test_http_forward_post_with_body() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server_echo_body("origin").await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+        .build()
+        .anyerr()?;
+    let res = client
+        .post(format!("http://{origin_addr}/upload"))
+        .body("hello request body")
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, "origin POST /upload: hello request body");
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// POST request with body through reverse proxy.
+#[tokio::test]
+#[traced_test]
+async fn test_http_reverse_post_with_body() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server_echo_body("origin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("http://{proxy_addr}/data"))
+        .body("post body content")
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, "origin POST /data: post body content");
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Invalid HTTP request returns 400 Bad Request.
+#[tokio::test]
+#[traced_test]
+async fn test_invalid_http_request() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Send garbage that's not valid HTTP
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.write_all(b"NOT VALID HTTP\r\n\r\n").await?;
+
+    let (status, _) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 400);
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Origin-form request to forward-only proxy returns 400.
+#[tokio::test]
+#[traced_test]
+async fn test_origin_form_to_forward_only_proxy() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+
+    // Only forward mode configured (no reverse)
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Send origin-form request (no scheme) - this is what a reverse proxy would handle
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream
+        .write_all(b"GET /path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await?;
+
+    let (status, _) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 400);
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Forward (absolute-form) request to reverse-only proxy returns 400.
+#[tokio::test]
+#[traced_test]
+async fn test_forward_request_to_reverse_only_proxy() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    // Only reverse mode configured (no forward)
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Send absolute-form request (with scheme) - this is what a forward proxy would handle
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let req = format!(
+        "GET http://{origin_addr}/path HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+
+    let (status, _) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 400);
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// CONNECT to reverse-only proxy returns 400.
+#[tokio::test]
+#[traced_test]
+async fn test_connect_to_reverse_only_proxy() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    // Only reverse mode configured
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Send CONNECT request
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let req = format!("CONNECT example.com:80 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+
+    let (status, _) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 400);
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// CONNECT to unreachable origin returns 502 Bad Gateway.
+#[tokio::test]
+#[traced_test]
+async fn test_connect_unreachable_origin() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // CONNECT to a port that's not listening
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream
+        .write_all(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+        .await?;
+
+    let (status, _) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 502);
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Multiple concurrent requests through the same proxy.
+#[tokio::test]
+#[traced_test]
+async fn test_concurrent_requests() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+        .build()
+        .anyerr()?;
+
+    // Spawn multiple concurrent requests
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let client = client.clone();
+        let url = format!("http://{origin_addr}/request/{i}");
+        handles.push(tokio::spawn(async move {
+            let res = client.get(&url).send().await?;
+            let text = res.text().await?;
+            Ok::<_, reqwest::Error>(text)
+        }));
+    }
+
+    // Verify all requests completed successfully
+    for (i, handle) in handles.into_iter().enumerate() {
+        let text = handle.await.anyerr()?.anyerr()?;
+        assert_eq!(text, format!("origin GET /request/{i}"));
+    }
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Large request body is forwarded correctly.
+#[tokio::test]
+#[traced_test]
+async fn test_large_request_body() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server_echo_body("origin").await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+        .build()
+        .anyerr()?;
+
+    // 1MB body
+    let body = "x".repeat(1024 * 1024);
+    let res = client
+        .post(format!("http://{origin_addr}/large"))
+        .body(body.clone())
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, format!("origin POST /large: {body}"));
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Both forward and reverse modes enabled - routes correctly based on request form.
+#[tokio::test]
+#[traced_test]
+async fn test_forward_and_reverse_combined() -> Result {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (forward_origin_addr, _forward_origin_task) = spawn_origin_server("forward").await?;
+    let (reverse_origin_addr, _reverse_origin_task) = spawn_origin_server("reverse").await?;
+
+    let reverse_destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&reverse_origin_addr.to_string())?,
+    );
+    let mode = ProxyMode::Http(
+        HttpProxyOpts::default()
+            .forward(ForwardProxyMode::Static(upstream_id))
+            .reverse(ReverseProxyMode::Static(reverse_destination)),
+    );
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Absolute-form request should go to forward origin
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+        .build()
+        .anyerr()?;
+    let res = client
+        .get(format!("http://{forward_origin_addr}/forward-path"))
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await.anyerr()?, "forward GET /forward-path");
+
+    // Origin-form request should go to reverse origin
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("http://{proxy_addr}/reverse-path"))
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await.anyerr()?, "reverse GET /reverse-path");
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// Spawns a simple HTTP origin server that echoes back "{label} {method} {path}: {body}".
+async fn spawn_origin_server_echo_body(
+    label: &'static str,
+) -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
+    let listener = TcpListener::bind("localhost:0").await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move { origin_server::run_echo_body(listener, label).await });
+    Ok((addr, AbortOnDropHandle::new(task)))
+}
+
 mod origin_server {
     use std::{convert::Infallible, sync::Arc};
 
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener;
@@ -618,6 +929,35 @@ mod origin_server {
                     async move {
                         let body = format!("{} {} {}", *label, req.method(), req.uri().path());
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
+                    }
+                };
+                let _ = http1::Builder::new()
+                    .serve_connection(io, service_fn(handler))
+                    .await;
+            });
+        }
+    }
+
+    /// Returns "{label} {METHOD} {PATH}: {BODY}" as response body.
+    pub(super) async fn run_echo_body(listener: TcpListener, label: &'static str) {
+        let label = Arc::new(label);
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let io = TokioIo::new(stream);
+            let label = label.clone();
+            tokio::task::spawn(async move {
+                let handler = move |req: Request<hyper::body::Incoming>| {
+                    let label = label.clone();
+                    async move {
+                        let method = req.method().clone();
+                        let path = req.uri().path().to_string();
+                        let body_bytes = req.collect().await.unwrap().to_bytes();
+                        let body_str = String::from_utf8_lossy(&body_bytes);
+                        let response =
+                            format!("{} {} {}: {}", *label, method, path, body_str);
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response))))
                     }
                 };
                 let _ = http1::Builder::new()
