@@ -1,4 +1,10 @@
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -11,7 +17,7 @@ use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::stream::{self, StreamExt};
 use quinn::ConnectionError;
 use tokio::net::TcpStream;
-use tracing::{Instrument, debug, instrument, warn};
+use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
     HEADER_SECTION_MAX_LENGTH, HttpResponse,
@@ -31,14 +37,16 @@ pub use auth::*;
 pub struct UpstreamProxy {
     #[debug("Arc<dyn AuthHandler>")]
     auth: Arc<DynAuthHandler<'static>>,
+    conn_id: Arc<AtomicU64>,
 }
 
 impl ProtocolHandler for UpstreamProxy {
-    #[instrument("accept", skip_all, fields(remote=%connection.remote_id().fmt_short()))]
+    #[instrument("accept", skip_all, fields(id=self.conn_id.fetch_add(1, Ordering::SeqCst)))]
     async fn accept(
         &self,
         connection: Connection,
     ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        debug!(remote_id=%connection.remote_id().fmt_short(), "accepted connection");
         self.handle_connection(connection)
             .await
             .map_err(AcceptError::from_err)
@@ -50,11 +58,13 @@ impl UpstreamProxy {
     pub fn new(auth: impl AuthHandler + 'static) -> Result<Self> {
         Ok(Self {
             auth: DynAuthHandler::new_arc(auth),
+            conn_id: Default::default(),
         })
     }
 
     async fn handle_connection(&self, connection: Connection) -> Result<()> {
         let remote_id = connection.remote_id();
+        let mut stream_id = 0;
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(streams) => streams,
@@ -69,8 +79,9 @@ impl UpstreamProxy {
                         warn!("Failed to handle streams: {err:#}");
                     }
                 }
-                .instrument(tracing::Span::current()),
+                .instrument(error_span!("stream", id=%stream_id)),
             );
+            stream_id += 1;
         }
     }
 
@@ -90,14 +101,14 @@ impl UpstreamProxy {
 
         match auth.authorize(remote_id, &req).await {
             Ok(()) => debug!("request is authorized, continue"),
-            Err(err) => {
-                debug!("request is not authorized, abort");
+            Err(reason) => {
+                debug!(?reason, "request is not authorized, abort");
                 HttpResponse::new(StatusCode::FORBIDDEN)
                     .write(&mut send)
                     .await
                     .ok();
                 send.finish().anyerr()?;
-                return Err(err.into());
+                return Ok(());
             }
         };
 
@@ -116,6 +127,7 @@ impl UpstreamProxy {
                             })
                             .ok();
                         send.finish().anyerr()?;
+                        Ok(())
                     }
                     Ok(tcp_stream) => {
                         debug!(?authority, "connected to upstream");
@@ -125,9 +137,9 @@ impl UpstreamProxy {
                             .context("Failed to write CONNECT response to downstream")?;
                         let (mut tcp_recv, mut tcp_send) = tcp_stream.into_split();
                         forward_bidi(&mut tcp_recv, &mut tcp_send, &mut recv, &mut send).await?;
+                        Ok(())
                     }
                 }
-                Ok(())
             }
             HttpProxyRequestKind::Absolute { method, target } => {
                 let client = reqwest::Client::new();

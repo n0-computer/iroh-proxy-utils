@@ -7,6 +7,7 @@ use iroh::{
 };
 use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
 use n0_error::{AnyError, Result, anyerr, stack_error};
+use n0_future::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
@@ -73,6 +74,7 @@ impl DownstreamProxy {
     pub async fn forward_tcp_listener(&self, listener: TcpListener, mode: ProxyMode) -> Result<()> {
         let cancel_token = CancellationToken::new();
         let _cancel_guard = cancel_token.clone().drop_guard();
+        let mut id = 0;
         loop {
             let (client_stream, client_addr) = listener.accept().await?;
             let this = self.clone();
@@ -81,10 +83,12 @@ impl DownstreamProxy {
                 cancel_token
                     .child_token()
                     .run_until_cancelled_owned(async move {
+                        debug!(%client_addr, "accepted TCP connection");
                         this.forward_tcp_stream(client_stream, &mode).await.ok();
                     })
-                    .instrument(error_span!("tcp-conn", client=%client_addr)),
+                    .instrument(error_span!("tcp-accept", id)),
             );
+            id += 1;
         }
     }
 
@@ -97,7 +101,10 @@ impl DownstreamProxy {
             // If this is a HTTP proxy, write an error response if the error is a proxy error.
             if let ProxyMode::Http(opts) = mode {
                 if let Some(response) = err.to_response() {
-                    let _ = opts.write_error_response(&response, &mut conn).await;
+                    debug!(?response, "send error response");
+                    if let Err(err) = opts.write_error_response(&response, &mut conn).await {
+                        debug!("failed to send error response: {err:#}");
+                    }
                 }
             }
             Err(err.into())
@@ -124,33 +131,38 @@ impl DownstreamProxy {
         let mut conn = match mode {
             ProxyMode::Tcp(destination) => self.create_tunnel(destination).await?,
             ProxyMode::Http(opts) => {
-                let (_header_len, request) = HttpRequest::read(&mut tcp_recv)
+                let (header_len, request) = HttpRequest::read(&mut tcp_recv)
                     .await
                     .map_err(|err| ProxyError::bad_request(err))?;
-                debug!(?request, "read request");
+                debug!(?request, header_len, "read request");
                 match &request {
                     HttpRequest::Forward(request) => {
                         let forward = opts.as_forward()?;
-                        let endpoint_id = forward.destination(&request).await?;
-                        self.connect(endpoint_id)
+                        let destination = forward.destination(&request).await?;
+                        debug!(destination=%destination.fmt_short(), "forwarding proxy request");
+                        self.connect(destination)
                             .await
                             .map_err(|err| ProxyError::gateway_timeout(err))?
                     }
                     HttpRequest::Origin(request) => {
                         let reverse = opts.as_reverse()?;
                         let destination = reverse.destination(request).await?;
+                        debug!(destination=%destination.fmt_short(), "forwarding origin request");
                         self.create_tunnel(&destination).await?
                     }
                 }
             }
         };
 
-        debug!("connected to remote");
+        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "connected to remote and start forwarding");
 
-        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
-            .await
-            .map_err(ProxyError::io)?;
-        debug!("closed");
+        let start = Instant::now();
+        let (to_upstream, from_upstream) =
+            forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
+                .await
+                .map_err(ProxyError::io)?;
+        let elapsed = start.elapsed();
+        debug!(to_upstream, from_upstream, ?elapsed, "finished");
         Ok(())
     }
 
@@ -195,6 +207,10 @@ impl EndpointAuthority {
             endpoint_id,
             authority,
         }
+    }
+
+    pub fn fmt_short(&self) -> String {
+        format!("{}->{}", self.endpoint_id.fmt_short(), self.authority)
     }
 }
 

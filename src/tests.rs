@@ -1,14 +1,19 @@
-use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use std::{collections::HashMap, io::Cursor, net::SocketAddr, str::FromStr, sync::OnceLock};
 
 use http::StatusCode;
-use iroh::{Endpoint, EndpointId, protocol::Router};
+use iroh::{
+    Endpoint, EndpointId, discovery::static_provider::StaticProvider, endpoint::BindError,
+    protocol::Router,
+};
 use n0_error::{Result, StdResultExt};
 use n0_future::task::AbortOnDropHandle;
 use n0_tracing_test::traced_test;
+use quinn::Accept;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
+use tracing::debug;
 
 use crate::{
     ALPN, Authority, HttpOriginRequest, HttpProxyRequest, HttpProxyRequestKind, HttpResponse,
@@ -18,6 +23,7 @@ use crate::{
         HttpProxyOpts, ProxyMode, ReverseProxyMode, ReverseProxyResolver,
     },
     upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
+    util::Prebuffered,
 };
 
 // TODO: Untested edge cases:
@@ -33,35 +39,56 @@ use crate::{
 
 // -- Test helpers --
 
+async fn bind_endpoint() -> Result<Endpoint, BindError> {
+    static STATIC_DISCOVERY: OnceLock<StaticProvider> = OnceLock::new();
+    let discovery = STATIC_DISCOVERY.get_or_init(|| StaticProvider::default());
+    let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        .discovery(discovery.clone())
+        .bind()
+        .await?;
+    discovery.add_endpoint_info(endpoint.addr());
+    Ok(endpoint)
+}
+
 /// Spawns an upstream iroh proxy that accepts all requests.
 async fn spawn_upstream_proxy() -> Result<(Router, EndpointId)> {
-    let router = Router::builder(Endpoint::bind().await?)
-        .accept(ALPN, UpstreamProxy::new(AcceptAll)?)
+    spawn_upstream_proxy_with_auth(AcceptAll).await
+}
+
+/// Spawns an upstream iroh proxy with a custom auth handler.
+async fn spawn_upstream_proxy_with_auth(
+    auth: impl AuthHandler + 'static,
+) -> Result<(Router, EndpointId)> {
+    let endpoint = bind_endpoint().await?;
+    let router = Router::builder(endpoint)
+        .accept(ALPN, UpstreamProxy::new(auth)?)
         .spawn();
-    router.endpoint().online().await;
-    let id = router.endpoint().id();
-    Ok((router, id))
+    let endpoint_id = router.endpoint().id();
+    debug!(endpoint_id=%endpoint_id.fmt_short(), "spawned upstream proxy");
+    Ok((router, endpoint_id))
 }
 
 /// Spawns a downstream proxy with given mode and returns (addr, endpoint_id, task).
 async fn spawn_downstream_proxy(
     mode: ProxyMode,
 ) -> Result<(SocketAddr, EndpointId, AbortOnDropHandle<Result>)> {
-    let endpoint = Endpoint::bind().await?;
+    let endpoint = bind_endpoint().await?;
     let endpoint_id = endpoint.id();
     let proxy = DownstreamProxy::new(endpoint, Default::default());
     let listener = TcpListener::bind("localhost:0").await?;
-    let addr = listener.local_addr()?;
+    let tcp_addr = listener.local_addr()?;
+    debug!(endpoint_id=%endpoint_id.fmt_short(), %tcp_addr, "spawned downstream proxy");
     let task = tokio::spawn(async move { proxy.forward_tcp_listener(listener, mode).await });
-    Ok((addr, endpoint_id, AbortOnDropHandle::new(task)))
+    Ok((tcp_addr, endpoint_id, AbortOnDropHandle::new(task)))
 }
 
 /// Spawns a simple HTTP origin server that echoes back "{label} {method} {path}".
 async fn spawn_origin_server(label: &'static str) -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
     let listener = TcpListener::bind("localhost:0").await?;
-    let addr = listener.local_addr()?;
+    let tcp_addr = listener.local_addr()?;
+    debug!(%label, %tcp_addr, "spawned origin server");
     let task = tokio::spawn(async move { origin_server::run(listener, label).await });
-    Ok((addr, AbortOnDropHandle::new(task)))
+    Ok((tcp_addr, AbortOnDropHandle::new(task)))
 }
 
 /// Spawns a simple TCP echo server.
@@ -83,9 +110,14 @@ async fn spawn_echo_server() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
 }
 
 /// Reads HTTP response and returns (status_code, body).
-async fn read_http_response(stream: &mut TcpStream) -> Result<(u16, String)> {
+async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<(u16, String)> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
+    // if buf.len() < 256 {
+    //     debug!("read http response: {:#}", String::from_utf8_lossy(&buf));
+    // } else {
+    //     debug!("read http response ({}b)", buf.len());
+    // }
 
     let (header_len, response) = HttpResponse::parse_with_len(&buf)?
         .ok_or_else(|| n0_error::anyerr!("Incomplete HTTP response"))?;
@@ -163,24 +195,14 @@ impl AuthHandler for AllowAuthorities {
                     .unwrap_or_default()
             }
         };
-        if self.0.contains(&target) {
+        let allowed = self.0.contains(&target);
+        debug!(?allowed, ?target, list=?self.0, "AllowAuthorities::authorize");
+        if allowed {
             Ok(())
         } else {
             Err(AuthError::Forbidden)
         }
     }
-}
-
-/// Spawns an upstream iroh proxy with a custom auth handler.
-async fn spawn_upstream_proxy_with_auth(
-    auth: impl AuthHandler + 'static,
-) -> Result<(Router, EndpointId)> {
-    let router = Router::builder(Endpoint::bind().await?)
-        .accept(ALPN, UpstreamProxy::new(auth)?)
-        .spawn();
-    router.endpoint().online().await;
-    let id = router.endpoint().id();
-    Ok((router, id))
 }
 
 // -- Tests --
@@ -505,6 +527,7 @@ async fn test_upstream_auth_endpoint() -> Result {
     let req2 = format!(
         "GET http://{origin_addr}/fail HTTP/1.1\r\n\
          Host: {origin_addr}\r\n\
+         {IROH_DESTINATION_HEADER}: {upstream_id}\r\n\
          Connection: close\r\n\r\n"
     );
     stream2.write_all(req2.as_bytes()).await?;
@@ -532,8 +555,8 @@ async fn test_upstream_auth_endpoint() -> Result {
 #[traced_test]
 async fn test_upstream_auth_authority() -> Result {
     // Two origins - one allowed, one not
-    let (allowed_addr, allowed_task) = spawn_origin_server("allowed").await?;
-    let (denied_addr, denied_task) = spawn_origin_server("denied").await?;
+    let (allowed_addr, _allowed_task) = spawn_origin_server("allowed").await?;
+    let (denied_addr, _denied_task) = spawn_origin_server("denied").await?;
 
     // Upstream that only allows connections to allowed_addr
     let (upstream_router, upstream_id) =
@@ -542,54 +565,53 @@ async fn test_upstream_auth_authority() -> Result {
     // Downstream forward proxy using CONNECT
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
-    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // CONNECT to allowed origin should succeed
-    let mut stream1 = TcpStream::connect(proxy_addr).await?;
-    let connect1 = format!("CONNECT {allowed_addr} HTTP/1.1\r\nHost: {allowed_addr}\r\n\r\n");
-    stream1.write_all(connect1.as_bytes()).await?;
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let (recv, mut send) = stream.split();
+    let connect = format!("CONNECT {allowed_addr} HTTP/1.1\r\nHost: {allowed_addr}\r\n\r\n");
+    send.write_all(connect.as_bytes()).await?;
+    let mut recv = Prebuffered::new(recv, 892);
+    let proxy_response = HttpResponse::read_and_cut(&mut recv).await?;
+    assert_eq!(proxy_response.status, StatusCode::OK);
 
-    let mut reader1 = BufReader::new(&mut stream1);
-    let mut line1 = String::new();
-    reader1.read_line(&mut line1).await?;
-    assert!(
-        line1.starts_with("HTTP/1.1 200"),
-        "Expected 200, got: {line1}"
-    );
-
-    // Skip headers, then send request through tunnel
-    loop {
-        let mut l = String::new();
-        reader1.read_line(&mut l).await?;
-        if l == "\r\n" {
-            break;
-        }
-    }
-    let stream1 = reader1.into_inner();
-    stream1
-        .write_all(b"GET /check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    send.write_all(b"GET /check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .await?;
-    let mut resp1 = String::new();
-    stream1.read_to_string(&mut resp1).await?;
-    assert!(resp1.contains("allowed GET /check"), "Response: {resp1}");
+    // TODO: If this line is uncommented, the test fails, but it shouldn't, right?
+    // send.shutdown().await?;
+    let (upstream_status, body) = read_http_response(&mut recv).await?;
+    assert_eq!(upstream_status, 200);
+    assert_eq!(body, "allowed GET /check");
 
     // CONNECT to denied origin should fail
-    let mut stream2 = TcpStream::connect(proxy_addr).await?;
-    let connect2 = format!("CONNECT {denied_addr} HTTP/1.1\r\nHost: {denied_addr}\r\n\r\n");
-    stream2.write_all(connect2.as_bytes()).await?;
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let (recv, mut send) = stream.split();
+    let connect = format!("CONNECT {denied_addr} HTTP/1.1\r\nHost: {denied_addr}\r\n\r\n");
+    send.write_all(connect.as_bytes()).await?;
+    let mut recv = Prebuffered::new(recv, 892);
+    let proxy_response = HttpResponse::read_and_cut(&mut recv).await?;
+    assert_eq!(proxy_response.status, StatusCode::FORBIDDEN);
+    let mut buf = Vec::new();
+    recv.read_to_end(&mut buf).await?;
+    assert_eq!(buf.len(), 0);
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        read_http_response(&mut stream2),
-    )
-    .await;
-    let (status, _) = result.anyerr()??;
-    assert!(status == 403, "Expected error for denied, got {status}");
+    // send.write_all(connect.as_bytes()).await?;
+
+    // let stream2 = TcpStream::connect(proxy_addr).await?;
+    // let connect2 = format!("CONNECT {denied_addr} HTTP/1.1\r\nHost: {denied_addr}\r\n\r\n");
+    // stream2.write_all(connect2.as_bytes()).await?;
+    // let proxy_response = HttpResponse::read_and_cut(&mut recv1).await?;
+
+    // let result = tokio::time::timeout(
+    //     std::time::Duration::from_secs(3),
+    //     read_http_response(&mut stream2),
+    // )
+    // .await;
+    // let (status, _) = result.anyerr()??;
+    // assert!(status == 403, "Expected error for denied, got {status}");
 
     upstream_router.shutdown().await.anyerr()?;
-    proxy_task.abort();
-    allowed_task.abort();
-    denied_task.abort();
     Ok(())
 }
 
@@ -955,8 +977,7 @@ mod origin_server {
                         let path = req.uri().path().to_string();
                         let body_bytes = req.collect().await.unwrap().to_bytes();
                         let body_str = String::from_utf8_lossy(&body_bytes);
-                        let response =
-                            format!("{} {} {}: {}", *label, method, path, body_str);
+                        let response = format!("{} {} {}: {}", *label, method, path, body_str);
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response))))
                     }
                 };

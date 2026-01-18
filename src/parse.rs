@@ -338,4 +338,10 @@ impl HttpResponse {
         )
         .into())
     }
+
+    pub async fn read_and_cut(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+        let (len, response) = Self::read(reader).await?;
+        reader.discard(len);
+        Ok(response)
+    }
 }
