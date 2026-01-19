@@ -11,15 +11,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
 
+pub use self::opts::{
+    ExtractError, ForwardProxyMode, ForwardProxyResolver, HttpProxyOpts, PoolOpts, ProxyMode,
+    ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
+};
 use crate::{
     ALPN, Authority, HEADER_SECTION_MAX_LENGTH,
     parse::{HttpRequest, HttpResponse},
     util::{Prebuffered, forward_bidi},
-};
-
-pub use self::opts::{
-    ExtractError, ForwardProxyMode, ForwardProxyResolver, HttpProxyOpts, PoolOpts, ProxyMode,
-    ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
 };
 
 pub(crate) mod opts;

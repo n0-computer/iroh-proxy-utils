@@ -4,9 +4,12 @@
 //! allows explicit buffering, inspection, partial consumption, and seamless
 //! fallthrough to the inner reader.
 
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use bytes::{BufMut, Bytes, BytesMut};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::io::{self, AsyncRead, AsyncReadExt, ReadBuf};
 
 /// Initial capacity for the internal buffer.
@@ -93,9 +96,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for Prebuffered<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
     use tokio::io::AsyncReadExt;
+
+    use super::*;
 
     fn cursor(data: &'static [u8]) -> Cursor<&'static [u8]> {
         Cursor::new(data)
