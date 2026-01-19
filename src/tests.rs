@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Cursor, net::SocketAddr, str::FromStr, sync::OnceLock};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::OnceLock, time::Duration};
 
 use http::StatusCode;
 use iroh::{
@@ -8,11 +8,11 @@ use iroh::{
 use n0_error::{Result, StdResultExt};
 use n0_future::task::AbortOnDropHandle;
 use n0_tracing_test::traced_test;
-use quinn::Accept;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
+use tokio_util::time::FutureExt;
 use tracing::debug;
 
 use crate::{
@@ -112,13 +112,11 @@ async fn spawn_echo_server() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
 /// Reads HTTP response and returns (status_code, body).
 async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<(u16, String)> {
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    // if buf.len() < 256 {
-    //     debug!("read http response: {:#}", String::from_utf8_lossy(&buf));
-    // } else {
-    //     debug!("read http response ({}b)", buf.len());
-    // }
-
+    stream
+        .read_to_end(&mut buf)
+        .timeout(Duration::from_secs(3))
+        .await
+        .anyerr()??;
     let (header_len, response) = HttpResponse::parse_with_len(&buf)?
         .ok_or_else(|| n0_error::anyerr!("Incomplete HTTP response"))?;
 
@@ -319,7 +317,7 @@ async fn test_http_forward_connect() -> Result {
 /// HTTP reverse proxy with origin-form requests (e.g. GET /path).
 #[tokio::test]
 #[traced_test]
-async fn test_http_reverse() -> Result {
+async fn test_http_reverse_simple() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
@@ -329,7 +327,7 @@ async fn test_http_reverse() -> Result {
     );
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Direct request to reverse proxy (no proxy config - sends origin-form)
     let client = reqwest::Client::new();
@@ -342,6 +340,7 @@ async fn test_http_reverse() -> Result {
     let text = res.text().await.anyerr()?;
     assert_eq!(text, "origin GET /reverse/path");
 
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
@@ -352,10 +351,10 @@ async fn test_http_reverse() -> Result {
 async fn test_http_forward_dynamic() -> Result {
     // Two upstreams with differently labeled origins
     let (upstream1_router, upstream1_id) = spawn_upstream_proxy().await?;
-    let (origin1_addr, origin1_task) = spawn_origin_server("alpha").await?;
+    let (origin1_addr, _origin1_task) = spawn_origin_server("alpha").await?;
 
     let (upstream2_router, upstream2_id) = spawn_upstream_proxy().await?;
-    let (origin2_addr, origin2_task) = spawn_origin_server("beta").await?;
+    let (origin2_addr, _origin2_task) = spawn_origin_server("beta").await?;
 
     let mode = ProxyMode::Http(HttpProxyOpts::default().forward(HeaderResolver));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
@@ -386,11 +385,9 @@ async fn test_http_forward_dynamic() -> Result {
     assert_eq!(status2, 200);
     assert_eq!(body2, "beta GET /path2");
 
+    drop(proxy_task);
     upstream1_router.shutdown().await.anyerr()?;
     upstream2_router.shutdown().await.anyerr()?;
-    proxy_task.abort();
-    origin1_task.abort();
-    origin2_task.abort();
     Ok(())
 }
 
@@ -494,7 +491,7 @@ async fn test_http_reverse_dynamic_unknown_subdomain() -> Result {
 #[tokio::test]
 #[traced_test]
 async fn test_upstream_auth_endpoint() -> Result {
-    let (origin_addr, origin_task) = spawn_origin_server("origin").await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
     // First spawn downstream to get its endpoint ID
     let mode_placeholder = ProxyMode::Http(HttpProxyOpts::default().forward(HeaderResolver));
@@ -533,20 +530,13 @@ async fn test_upstream_auth_endpoint() -> Result {
     stream2.write_all(req2.as_bytes()).await?;
 
     // Should fail (error status or connection closed)
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        read_http_response(&mut stream2),
-    )
-    .await;
-    match result {
-        Ok(Ok((status, _))) => assert!(status >= 400, "Expected error, got {status}"),
-        Ok(Err(_)) | Err(_) => {} // Connection error or timeout is expected
-    }
+    let (status, body) = read_http_response(&mut stream2).await?;
+    assert_eq!(status, 403);
+    assert!(body.is_empty());
 
+    drop(proxy_task);
+    drop(proxy_task2);
     upstream_router.shutdown().await.anyerr()?;
-    proxy_task.abort();
-    proxy_task2.abort();
-    origin_task.abort();
     Ok(())
 }
 
@@ -573,16 +563,16 @@ async fn test_upstream_auth_authority() -> Result {
     let connect = format!("CONNECT {allowed_addr} HTTP/1.1\r\nHost: {allowed_addr}\r\n\r\n");
     send.write_all(connect.as_bytes()).await?;
     let mut recv = Prebuffered::new(recv, 892);
-    let proxy_response = HttpResponse::read_and_cut(&mut recv).await?;
+    let proxy_response = HttpResponse::read(&mut recv).await?;
     assert_eq!(proxy_response.status, StatusCode::OK);
 
     send.write_all(b"GET /check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .await?;
-    // TODO: If this line is uncommented, the test fails, but it shouldn't, right?
-    // send.shutdown().await?;
     let (upstream_status, body) = read_http_response(&mut recv).await?;
     assert_eq!(upstream_status, 200);
     assert_eq!(body, "allowed GET /check");
+    drop(recv);
+    drop(send);
 
     // CONNECT to denied origin should fail
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -590,26 +580,11 @@ async fn test_upstream_auth_authority() -> Result {
     let connect = format!("CONNECT {denied_addr} HTTP/1.1\r\nHost: {denied_addr}\r\n\r\n");
     send.write_all(connect.as_bytes()).await?;
     let mut recv = Prebuffered::new(recv, 892);
-    let proxy_response = HttpResponse::read_and_cut(&mut recv).await?;
+    let proxy_response = HttpResponse::read(&mut recv).await?;
     assert_eq!(proxy_response.status, StatusCode::FORBIDDEN);
     let mut buf = Vec::new();
     recv.read_to_end(&mut buf).await?;
     assert_eq!(buf.len(), 0);
-
-    // send.write_all(connect.as_bytes()).await?;
-
-    // let stream2 = TcpStream::connect(proxy_addr).await?;
-    // let connect2 = format!("CONNECT {denied_addr} HTTP/1.1\r\nHost: {denied_addr}\r\n\r\n");
-    // stream2.write_all(connect2.as_bytes()).await?;
-    // let proxy_response = HttpResponse::read_and_cut(&mut recv1).await?;
-
-    // let result = tokio::time::timeout(
-    //     std::time::Duration::from_secs(3),
-    //     read_http_response(&mut stream2),
-    // )
-    // .await;
-    // let (status, _) = result.anyerr()??;
-    // assert!(status == 403, "Expected error for denied, got {status}");
 
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
@@ -659,7 +634,7 @@ async fn test_http_reverse_post_with_body() -> Result {
     );
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::new();
     let res = client
@@ -672,6 +647,17 @@ async fn test_http_reverse_post_with_body() -> Result {
     let text = res.text().await.anyerr()?;
     assert_eq!(text, "origin POST /data: post body content");
 
+    let res = client
+        .post(format!("http://{proxy_addr}/data"))
+        .body("post body content 2")
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, "origin POST /data: post body content 2");
+
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
@@ -684,7 +670,7 @@ async fn test_invalid_http_request() -> Result {
 
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send garbage that's not valid HTTP
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -693,6 +679,7 @@ async fn test_invalid_http_request() -> Result {
     let (status, _) = read_http_response(&mut stream).await?;
     assert_eq!(status, 400);
 
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
@@ -706,7 +693,7 @@ async fn test_origin_form_to_forward_only_proxy() -> Result {
     // Only forward mode configured (no reverse)
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send origin-form request (no scheme) - this is what a reverse proxy would handle
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -717,6 +704,7 @@ async fn test_origin_form_to_forward_only_proxy() -> Result {
     let (status, _) = read_http_response(&mut stream).await?;
     assert_eq!(status, 400);
 
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
@@ -735,7 +723,7 @@ async fn test_forward_request_to_reverse_only_proxy() -> Result {
     // Only reverse mode configured (no forward)
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send absolute-form request (with scheme) - this is what a forward proxy would handle
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -747,6 +735,7 @@ async fn test_forward_request_to_reverse_only_proxy() -> Result {
     let (status, _) = read_http_response(&mut stream).await?;
     assert_eq!(status, 400);
 
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
@@ -765,7 +754,7 @@ async fn test_connect_to_reverse_only_proxy() -> Result {
     // Only reverse mode configured
     let mode =
         ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send CONNECT request
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -775,6 +764,7 @@ async fn test_connect_to_reverse_only_proxy() -> Result {
     let (status, _) = read_http_response(&mut stream).await?;
     assert_eq!(status, 400);
 
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }
@@ -889,7 +879,7 @@ async fn test_forward_and_reverse_combined() -> Result {
             .forward(ForwardProxyMode::Static(upstream_id))
             .reverse(ReverseProxyMode::Static(reverse_destination)),
     );
-    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Absolute-form request should go to forward origin
     let client = reqwest::Client::builder()
@@ -914,6 +904,7 @@ async fn test_forward_and_reverse_combined() -> Result {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.text().await.anyerr()?, "reverse GET /reverse-path");
 
+    drop(proxy_task);
     upstream_router.shutdown().await.anyerr()?;
     Ok(())
 }

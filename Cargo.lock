@@ -2039,8 +2039,6 @@ dependencies = [
 [[package]]
 name = "n0-tracing-test"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "274dc19cfda091561b364e4f61b39aa959ade203232f9794884f1911022e8e59"
 dependencies = [
  "n0-tracing-test-macro",
  "tracing-core",
@@ -2050,8 +2048,6 @@ dependencies = [
 [[package]]
 name = "n0-tracing-test-macro"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab691281e87f2453a860e76dde99157f4464df18cb7cb3eb9c3847161ccc4ce1"
 dependencies = [
  "quote",
  "syn 2.0.111",
@@ -3626,6 +3622,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 

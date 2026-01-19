@@ -7,7 +7,6 @@ use iroh::{
 };
 use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
 use n0_error::{AnyError, Result, anyerr, stack_error};
-use n0_future::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
@@ -52,12 +51,10 @@ impl DownstreamProxy {
         conn.send
             .write_all(destination.authority.to_connect_request().as_bytes())
             .await?;
-        debug!("created tunnel");
-        let (header_len, response) = HttpResponse::read(&mut conn.recv)
+        let response = HttpResponse::read(&mut conn.recv)
             .await
             .map_err(|err| ProxyError::bad_gateway(err))?;
-        debug!(?response, ?header_len, "got proxy response");
-        conn.recv.discard(header_len);
+        debug!(status=%response.status, "response from upstream");
         if response.status != StatusCode::OK {
             Err(ProxyError::new(
                 Some(response.status),
@@ -97,7 +94,7 @@ impl DownstreamProxy {
     /// Note: only the initial request is parsed; subsequent bytes are streamed as-is.
     pub async fn forward_tcp_stream(&self, mut conn: TcpStream, mode: &ProxyMode) -> Result<()> {
         if let Err(err) = self.forward_tcp_stream_inner(&mut conn, mode).await {
-            warn!("Forwarding TCP stream closed with error: {err:#}");
+            warn!("Error while forwarding TCP stream: {err:#}");
             // If this is a HTTP proxy, write an error response if the error is a proxy error.
             if let ProxyMode::Http(opts) = mode {
                 if let Some(response) = err.to_response() {
@@ -131,7 +128,7 @@ impl DownstreamProxy {
         let mut conn = match mode {
             ProxyMode::Tcp(destination) => self.create_tunnel(destination).await?,
             ProxyMode::Http(opts) => {
-                let (header_len, request) = HttpRequest::read(&mut tcp_recv)
+                let (header_len, request) = HttpRequest::peek(&mut tcp_recv)
                     .await
                     .map_err(|err| ProxyError::bad_request(err))?;
                 debug!(?request, header_len, "read request");
@@ -154,15 +151,10 @@ impl DownstreamProxy {
             }
         };
 
-        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "connected to remote and start forwarding");
-
-        let start = Instant::now();
-        let (to_upstream, from_upstream) =
-            forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
-                .await
-                .map_err(ProxyError::io)?;
-        let elapsed = start.elapsed();
-        debug!(to_upstream, from_upstream, ?elapsed, "finished");
+        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
+        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
+            .await
+            .map_err(ProxyError::io)?;
         Ok(())
     }
 

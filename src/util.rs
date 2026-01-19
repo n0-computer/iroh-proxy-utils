@@ -1,7 +1,7 @@
 use iroh::endpoint::SendStream;
 use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace};
+use tracing::trace;
 
 pub(crate) use self::prebuffered::Prebuffered;
 
@@ -51,18 +51,17 @@ pub(crate) async fn forward_bidi(
         async {
             let res = tokio::io::copy(downstream_recv, upstream_send).await;
             upstream_send.shutdown().await.ok();
-            trace!(?res, elapsed=?start.elapsed(), "forward bidi down-to-up finished");
+            trace!(?res, elapsed=?start.elapsed(), "forward down-to-up finished");
             res
         },
         async {
             let res = tokio::io::copy(upstream_recv, downstream_send).await;
             downstream_send.shutdown().await.ok();
-            trace!(?res, elapsed=?start.elapsed(), "forward bidi up-to-down finished");
+            trace!(?res, elapsed=?start.elapsed(), "forward up-to-down finished");
             res
         }
     );
     let r1 = r1.context("failed to copy down-to-up")?;
     let r2 = r2.context("failed to copy up-to-down")?;
-    trace!(down_to_up=r1, up_to_down=r2, elapsed=?start.elapsed(), "forward bidi done");
     Ok((r1, r2))
 }

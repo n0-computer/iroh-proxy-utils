@@ -4,19 +4,20 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use bytes::Bytes;
 use http::StatusCode;
 use iroh::{
     EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
+    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
 use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::stream::{self, StreamExt};
-use quinn::ConnectionError;
 use tokio::net::TcpStream;
+use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
@@ -28,6 +29,8 @@ use crate::{
 mod auth;
 pub use auth::*;
 
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The `UpstreamProxy` accepts iroh streams and forwards them to upstream TCP destinations.
 ///
 /// It implements [`ProtocolHandler`] and is intended to be mounted onto a [`Router`].
@@ -38,10 +41,12 @@ pub struct UpstreamProxy {
     #[debug("Arc<dyn AuthHandler>")]
     auth: Arc<DynAuthHandler<'static>>,
     conn_id: Arc<AtomicU64>,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl ProtocolHandler for UpstreamProxy {
-    #[instrument("accept", skip_all, fields(id=self.conn_id.fetch_add(1, Ordering::SeqCst)))]
+    #[instrument("accept", level="error", skip_all, fields(id=self.conn_id.fetch_add(1, Ordering::SeqCst)))]
     async fn accept(
         &self,
         connection: Connection,
@@ -51,6 +56,19 @@ impl ProtocolHandler for UpstreamProxy {
             .await
             .map_err(AcceptError::from_err)
     }
+
+    async fn shutdown(&self) {
+        self.shutdown.cancel();
+        self.tasks.close();
+        debug!("shutting down ({} pending tasks)", self.tasks.len());
+        match self.tasks.wait().timeout(GRACEFUL_SHUTDOWN_TIMEOUT).await {
+            Ok(_) => debug!("all streams closed cleanly"),
+            Err(_) => debug!(
+                remaining = self.tasks.len(),
+                "not all streams closed in time, abort"
+            ),
+        }
+    }
 }
 
 impl UpstreamProxy {
@@ -59,6 +77,8 @@ impl UpstreamProxy {
         Ok(Self {
             auth: DynAuthHandler::new_arc(auth),
             conn_id: Default::default(),
+            shutdown: CancellationToken::new(),
+            tasks: TaskTracker::new(),
         })
     }
 
@@ -66,17 +86,34 @@ impl UpstreamProxy {
         let remote_id = connection.remote_id();
         let mut stream_id = 0;
         loop {
-            let (send, recv) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(ConnectionError::ApplicationClosed(_)) => return Ok(()),
-                Err(err) => return Err(err).std_context("connection closed"),
+            let (send, recv) = match connection
+                .accept_bi()
+                .with_cancellation_token(&self.shutdown)
+                .await
+            {
+                None => return Ok(()),
+                Some(Ok(streams)) => streams,
+                Some(Err(ConnectionError::ApplicationClosed(_))) => {
+                    debug!("connection closed by downstream remote");
+                    return Ok(());
+                }
+                Some(Err(err)) => {
+                    return Err(err).std_context("failed to accept streams");
+                }
             };
             let auth = self.auth.clone();
-            tokio::spawn(
+            let shutdown = self.shutdown.clone();
+            self.tasks.spawn(
+                // We don't actually shutdown the stream task. If it didn't end by the time we stop waiting at shutdown,
+                // the connection will be closed, which causes the task to finish.
                 async move {
                     if let Err(err) = Self::handle_remote_streams(auth, remote_id, send, recv).await
                     {
-                        warn!("Failed to handle streams: {err:#}");
+                        if shutdown.is_cancelled() {
+                            debug!("aborted at shutdown: {err:#}");
+                        } else {
+                            warn!("failed to handle streams: {err:#}");
+                        }
                     }
                 }
                 .instrument(error_span!("stream", id=%stream_id)),
@@ -92,7 +129,7 @@ impl UpstreamProxy {
         recv: RecvStream,
     ) -> Result<()> {
         let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
-        let (header_section_len, req) = HttpRequest::read(&mut recv).await?;
+        let req = HttpRequest::read(&mut recv).await?;
 
         debug!(?req, "incoming request");
         let req = req
@@ -114,11 +151,9 @@ impl UpstreamProxy {
 
         match req.kind {
             HttpProxyRequestKind::Tunnel { target: authority } => {
-                // Remove the CONNECT request from the recv stream, because it may not be forwarded to the origin server.
-                recv.discard(header_section_len);
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
-                        warn!("Failed to connect to upstream server: {err:#}");
+                        warn!("Failed to connect to origin server: {err:#}");
                         HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
                             .write(&mut send)
                             .await
@@ -130,23 +165,20 @@ impl UpstreamProxy {
                         Ok(())
                     }
                     Ok(tcp_stream) => {
-                        debug!(?authority, "connected to upstream");
+                        debug!(%authority, "connected to origin");
                         HttpResponse::with_reason(StatusCode::OK, "Connection Established")
                             .write(&mut send)
                             .await
                             .context("Failed to write CONNECT response to downstream")?;
-                        let (mut tcp_recv, mut tcp_send) = tcp_stream.into_split();
-                        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut recv, &mut send).await?;
+                        let (mut origin_recv, mut origin_send) = tcp_stream.into_split();
+                        forward_bidi(&mut origin_recv, &mut origin_send, &mut recv, &mut send)
+                            .await?;
                         Ok(())
                     }
                 }
             }
             HttpProxyRequestKind::Absolute { method, target } => {
                 let client = reqwest::Client::new();
-
-                // Remove the request headers from the buffer, leaving only the body.
-                recv.discard(header_section_len);
-
                 // Convert the Prebuffered<RecvStream> into a stream of Result<Bytes, std::io::Error>
                 let (init, recv) = recv.into_parts();
                 let body = stream::unfold((Some(init), recv), async |(mut init, mut recv)| {

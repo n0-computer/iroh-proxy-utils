@@ -141,8 +141,10 @@ impl HttpOriginRequest {
 impl HttpRequest {
     /// Reads and parses the request line and header section.
     ///
+    /// Does not remove the header section from `reader`.
     /// Returns the length of the header section and the request.
-    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
+    /// Returns [`io::ErrorKind::OutOfMemory`] if the header section exceeds the buffer limit.
+    pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
             if let Some(request) = Self::parse_with_len(reader.buffer())? {
@@ -154,6 +156,16 @@ impl HttpRequest {
             "Buffer size limit reached before end of request header section",
         )
         .into())
+    }
+
+    /// Reads and parses the request line and header section.
+    ///
+    /// Removes the header section from `reader`.
+    /// Returns [`io::ErrorKind::OutOfMemory`] if the header section exceeds the buffer limit.
+    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+        let (len, response) = Self::peek(reader).await?;
+        reader.discard(len);
+        Ok(response)
     }
 
     /// Parses a request from a buffer and returns `None` when incomplete.
@@ -323,8 +335,9 @@ impl HttpResponse {
 
     /// Reads and parses the response status line and header section.
     ///
-    /// Note: returns `OutOfMemory` if the header section exceeds the buffer limit.
-    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
+    /// Does not remove the header section from `reader`.
+    /// Returns [`io::ErrorKind::OutOfMemory`] if the header section exceeds the buffer limit.
+    pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
             if let Some(response) = Self::parse_with_len(reader.buffer())? {
@@ -339,8 +352,9 @@ impl HttpResponse {
         .into())
     }
 
-    pub async fn read_and_cut(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
-        let (len, response) = Self::read(reader).await?;
+    /// Reads and parses the response status line and header section.
+    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+        let (len, response) = Self::peek(reader).await?;
         reader.discard(len);
         Ok(response)
     }
