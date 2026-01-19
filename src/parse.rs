@@ -7,7 +7,7 @@ use http::{
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::util::{Prebuffered, status_line};
+use crate::util::Prebuffered;
 
 /// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]
@@ -292,7 +292,14 @@ impl HttpResponse {
 
     /// Formats a status line suitable for an HTTP/1.x response.
     pub fn status_line(&self) -> String {
-        status_line(self.status, self.reason.as_deref())
+        format!(
+            "HTTP/1.1 {} {}\r\n",
+            self.status.as_u16(),
+            self.reason
+                .as_deref()
+                .or(self.status.canonical_reason())
+                .unwrap_or("")
+        )
     }
 
     /// Parses a response from a buffer and returns `None` when incomplete.

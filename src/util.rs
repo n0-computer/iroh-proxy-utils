@@ -1,40 +1,10 @@
-use iroh::endpoint::SendStream;
-use n0_error::{Result, StackResultExt, StdResultExt};
+use n0_error::{Result, StackResultExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
 pub(crate) use self::prebuffered::Prebuffered;
 
 mod prebuffered;
-
-pub(crate) fn status_line(status: http::StatusCode, reason: Option<&str>) -> String {
-    format!(
-        "HTTP/1.1 {} {}\r\n",
-        status.as_u16(),
-        reason.or(status.canonical_reason()).unwrap_or("")
-    )
-}
-
-pub(crate) async fn write_reqwest_response(
-    res: &reqwest::Response,
-    send: &mut SendStream,
-) -> Result<()> {
-    let status_line = format!(
-        "{:?} {} {}\r\n",
-        res.version(),
-        res.status().as_u16(),
-        res.status().canonical_reason().unwrap_or_default()
-    );
-    send.write_all(status_line.as_bytes()).await.anyerr()?;
-    for (name, value) in res.headers() {
-        send.write_all(name.as_str().as_bytes()).await.anyerr()?;
-        send.write_all(b": ").await.anyerr()?;
-        send.write_all(value.as_bytes()).await.anyerr()?;
-        send.write_all(b"\r\n").await.anyerr()?;
-    }
-    send.write_all(b"\r\n").await.anyerr()?;
-    Ok(())
-}
 
 /// Bidirectionally forward data from a quinn stream and an arbitrary tokio
 /// reader/writer pair.

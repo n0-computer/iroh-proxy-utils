@@ -67,7 +67,7 @@ impl DownstreamProxy {
 
     /// Accepts TCP connections from the listener and forwards each in a new task.
     ///
-    /// Note: this runs indefinitely until the listener errors or the task is cancelled.
+    /// Runs indefinitely until the listener errors or the task is cancelled.
     pub async fn forward_tcp_listener(&self, listener: TcpListener, mode: ProxyMode) -> Result<()> {
         let cancel_token = CancellationToken::new();
         let _cancel_guard = cancel_token.clone().drop_guard();
@@ -89,9 +89,12 @@ impl DownstreamProxy {
         }
     }
 
-    /// Forwards a single TCP stream based on the first HTTP request.
+    /// Forwards a single TCP stream.
     ///
-    /// Note: only the initial request is parsed; subsequent bytes are streamed as-is.
+    /// For [`ProxyMode::Http`], this parses the first HTTP request from the stream, and then forwards or rejects according
+    /// to the configured [`HttpProxyOpts`].
+    /// For [`ProxyMode::Tcp`], this creates a CONNECT tunnel to the configured upstream and authority, and forwards the TCP
+    /// stream without parsing anything.
     pub async fn forward_tcp_stream(&self, mut conn: TcpStream, mode: &ProxyMode) -> Result<()> {
         if let Err(err) = self.forward_tcp_stream_inner(&mut conn, mode).await {
             warn!("Error while forwarding TCP stream: {err:#}");
@@ -128,6 +131,7 @@ impl DownstreamProxy {
         let mut conn = match mode {
             ProxyMode::Tcp(destination) => self.create_tunnel(destination).await?,
             ProxyMode::Http(opts) => {
+                // Read the HTTP header section, but don't remove it from the reader as it should be forwarded too.
                 let (header_len, request) = HttpRequest::peek(&mut tcp_recv)
                     .await
                     .map_err(ProxyError::bad_request)?;

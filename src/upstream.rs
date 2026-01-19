@@ -23,7 +23,7 @@ use tracing::{Instrument, debug, error_span, instrument, warn};
 use crate::{
     HEADER_SECTION_MAX_LENGTH, HttpResponse,
     parse::{HttpProxyRequestKind, HttpRequest},
-    util::{Prebuffered, forward_bidi, write_reqwest_response},
+    util::{Prebuffered, forward_bidi},
 };
 
 mod auth;
@@ -43,6 +43,7 @@ pub struct UpstreamProxy {
     conn_id: Arc<AtomicU64>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
+    http_client: reqwest::Client,
 }
 
 impl ProtocolHandler for UpstreamProxy {
@@ -79,6 +80,7 @@ impl UpstreamProxy {
             conn_id: Default::default(),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            http_client: reqwest::Client::new(),
         })
     }
 
@@ -103,11 +105,13 @@ impl UpstreamProxy {
             };
             let auth = self.auth.clone();
             let shutdown = self.shutdown.clone();
+            let http_client = self.http_client.clone();
             self.tasks.spawn(
                 // We don't actually shutdown the stream task. If it didn't end by the time we stop waiting at shutdown,
                 // the connection will be closed, which causes the task to finish.
                 async move {
-                    if let Err(err) = Self::handle_remote_streams(auth, remote_id, send, recv).await
+                    if let Err(err) =
+                        Self::handle_remote_streams(auth, remote_id, send, recv, http_client).await
                     {
                         if shutdown.is_cancelled() {
                             debug!("aborted at shutdown: {err:#}");
@@ -127,6 +131,7 @@ impl UpstreamProxy {
         remote_id: EndpointId,
         mut send: SendStream,
         recv: RecvStream,
+        http_client: reqwest::Client,
     ) -> Result<()> {
         let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
         let req = HttpRequest::read(&mut recv).await?;
@@ -178,33 +183,18 @@ impl UpstreamProxy {
                 }
             }
             HttpProxyRequestKind::Absolute { method, target } => {
-                let client = reqwest::Client::new();
-                // Convert the Prebuffered<RecvStream> into a stream of Result<Bytes, std::io::Error>
-                let (init, recv) = recv.into_parts();
-                let body = stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
-                    let item: io::Result<Bytes> = if let Some(init) = init.take() {
-                        Ok(init)
-                    } else {
-                        match recv.read_chunk(8192, true).await {
-                            Err(err) => Err(err.into()),
-                            Ok(None) => return None,
-                            Ok(Some(chunk)) => Ok(chunk.bytes),
-                        }
-                    };
-                    Some((item, (None, recv)))
-                });
+                let body = recv_stream_to_body(recv);
 
                 // Forward the request to the upstream server.
-                let res = client
+                let res = http_client
                     .request(method, target)
                     // TODO: Filter out hop-to-hop-headers that should not be forwarded to upstream.
                     .headers(req.headers)
-                    .body(reqwest::Body::wrap_stream(body))
+                    .body(body)
                     .send()
                     .await
                     .anyerr()?;
-
-                write_reqwest_response(&res, &mut send).await?;
+                write_response_header(&res, &mut send).await?;
                 let mut body = res.bytes_stream();
                 while let Some(bytes) = body.next().await {
                     let bytes = bytes.anyerr()?;
@@ -215,4 +205,41 @@ impl UpstreamProxy {
             }
         }
     }
+}
+
+// Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].
+fn recv_stream_to_body(recv: Prebuffered<RecvStream>) -> reqwest::Body {
+    let (init, recv) = recv.into_parts();
+    let body = stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
+        let item: io::Result<Bytes> = if let Some(init) = init.take() {
+            Ok(init)
+        } else {
+            match recv.read_chunk(8192, true).await {
+                Err(err) => Err(err.into()),
+                Ok(None) => return None,
+                Ok(Some(chunk)) => Ok(chunk.bytes),
+            }
+        };
+        Some((item, (None, recv)))
+    });
+    reqwest::Body::wrap_stream(body)
+}
+
+async fn write_response_header(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {
+    let status_line = format!(
+        "{:?} {} {}\r\n",
+        res.version(),
+        res.status().as_u16(),
+        // TODO: get reason phrase as returned from upstream.
+        res.status().canonical_reason().unwrap_or_default()
+    );
+    send.write_all(status_line.as_bytes()).await.anyerr()?;
+    for (name, value) in res.headers() {
+        send.write_all(name.as_str().as_bytes()).await.anyerr()?;
+        send.write_all(b": ").await.anyerr()?;
+        send.write_all(value.as_bytes()).await.anyerr()?;
+        send.write_all(b"\r\n").await.anyerr()?;
+    }
+    send.write_all(b"\r\n").await.anyerr()?;
+    Ok(())
 }
