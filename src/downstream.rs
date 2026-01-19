@@ -47,13 +47,13 @@ impl DownstreamProxy {
         let mut conn = self
             .connect(destination.endpoint_id)
             .await
-            .map_err(|err| ProxyError::gateway_timeout(err))?;
+            .map_err(ProxyError::gateway_timeout)?;
         conn.send
             .write_all(destination.authority.to_connect_request().as_bytes())
             .await?;
         let response = HttpResponse::read(&mut conn.recv)
             .await
-            .map_err(|err| ProxyError::bad_gateway(err))?;
+            .map_err(ProxyError::bad_gateway)?;
         debug!(status=%response.status, "response from upstream");
         if response.status != StatusCode::OK {
             Err(ProxyError::new(
@@ -96,12 +96,12 @@ impl DownstreamProxy {
         if let Err(err) = self.forward_tcp_stream_inner(&mut conn, mode).await {
             warn!("Error while forwarding TCP stream: {err:#}");
             // If this is a HTTP proxy, write an error response if the error is a proxy error.
-            if let ProxyMode::Http(opts) = mode {
-                if let Some(response) = err.to_response() {
-                    debug!(?response, "send error response");
-                    if let Err(err) = opts.write_error_response(&response, &mut conn).await {
-                        debug!("failed to send error response: {err:#}");
-                    }
+            if let ProxyMode::Http(opts) = mode
+                && let Some(response) = err.to_response()
+            {
+                debug!(?response, "send error response");
+                if let Err(err) = opts.write_error_response(&response, &mut conn).await {
+                    debug!("failed to send error response: {err:#}");
                 }
             }
             Err(err.into())
@@ -130,16 +130,16 @@ impl DownstreamProxy {
             ProxyMode::Http(opts) => {
                 let (header_len, request) = HttpRequest::peek(&mut tcp_recv)
                     .await
-                    .map_err(|err| ProxyError::bad_request(err))?;
+                    .map_err(ProxyError::bad_request)?;
                 debug!(?request, header_len, "read request");
                 match &request {
                     HttpRequest::Forward(request) => {
                         let forward = opts.as_forward()?;
-                        let destination = forward.destination(&request).await?;
+                        let destination = forward.destination(request).await?;
                         debug!(destination=%destination.fmt_short(), "forwarding proxy request");
                         self.connect(destination)
                             .await
-                            .map_err(|err| ProxyError::gateway_timeout(err))?
+                            .map_err(ProxyError::gateway_timeout)?
                     }
                     HttpRequest::Origin(request) => {
                         let reverse = opts.as_reverse()?;

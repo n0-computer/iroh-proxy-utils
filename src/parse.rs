@@ -181,7 +181,7 @@ impl HttpRequest {
     pub fn parse_with_len(buf: &[u8]) -> Result<Option<(usize, Self)>> {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
-        match req.parse(&buf[..]).std_context("Invalid HTTP request")? {
+        match req.parse(buf).std_context("Invalid HTTP request")? {
             httparse::Status::Partial => Ok(None),
             httparse::Status::Complete(header_len) => {
                 Self::from_request(req).map(|req| Some((header_len, req)))
@@ -189,12 +189,12 @@ impl HttpRequest {
         }
     }
 
-    fn from_request<'a>(req: httparse::Request) -> Result<Self> {
+    fn from_request(req: httparse::Request) -> Result<Self> {
         let method_str = req.method.context("Missing HTTP method")?;
         let method = method_str.parse().std_context("Invalid HTTP method")?;
         let path = req.path.context("Missing request target")?;
         let uri = Uri::from_str(path).std_context("Invalid request target")?;
-        let headers = http::HeaderMap::from_iter(req.headers.into_iter().flat_map(|h| {
+        let headers = http::HeaderMap::from_iter(req.headers.iter_mut().flat_map(|h| {
             let value = HeaderValue::from_bytes(h.value).ok()?;
             let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
             Some((name, value))

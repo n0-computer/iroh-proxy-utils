@@ -138,7 +138,7 @@ impl ForwardProxyMode {
     /// Note: extractor failures map to HTTP error status codes via `ExtractError`.
     pub async fn destination(&self, req: &HttpProxyRequest) -> Result<EndpointId, ExtractError> {
         match self {
-            Self::Static(destination) => Ok(destination.clone()),
+            Self::Static(destination) => Ok(*destination),
             Self::Dynamic(extractor) => extractor.destination(req).await,
         }
     }
@@ -228,7 +228,7 @@ impl WriteErrorResponse for DefaultResponseWriter {
         writer.write_all(res.status_line().as_bytes()).await?;
         let content = format!("{} {}", res.status.as_u16(), res.reason());
         writer
-            .write_all(format!("Content-Type: text/plain\r\n").as_bytes())
+            .write_all("Content-Type: text/plain\r\n".to_string().as_bytes())
             .await?;
         writer
             .write_all(format!("Content-Length: {}\r\n\r\n", content.len()).as_bytes())
