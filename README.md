@@ -2,8 +2,8 @@
 
 ![CI](https://github.com/n0-computer/iroh-proxy-utils/actions/workflows/ci.yml/badge.svg)
 [![Crates.io](https://img.shields.io/crates/v/iroh-proxy-utils.svg)](https://crates.io/crates/iroh-proxy-utils)
-[![Documentation](https://docs.rs/iroh-proxy-utils/badge.svg)](https://docs.rs/iroh-proxy-utils)
-[![License](https://img.shields.io/crates/l/iroh-proxy-utils)](https://crates.io/crates/iroh-proxy-utils)
+[![Documentation](https://docs.rs/iroh-proxy-utils/badge.svg)](https://docs.rs/redb)
+[![License](https://img.shields.io/crates/l/iroh-proxy-utils)](https://crates.io/crates/redb)
 
 Primitives for TCP and HTTP proxying over [iroh](https://github.com/n0-computer/iroh) connections.
 
@@ -21,7 +21,7 @@ This crate provides two main components for building HTTP proxies that bridge TC
 
 ## Protocol
 
-The downstream and upstream proxy establish iroh connections with the ALPN identifier `iroh-http-proxy`. On each connections, the downstream proxy can open any number of bidirectional streams. Each bidirectional stream contains a HTTP/1.1 connection. Each of these may either be a `CONNECT` request to establish a tunnel to an origin from the upstream proxy, or a absolute-form request which is forwarded to its origin by the upstream proxy.
+The downstream and upstream proxy establish iroh connections with the ALPN identifier `iroh-http-proxy/1`. On each connections, the downstream proxy can open any number of bidirectional streams. Each bidirectional stream contains a HTTP/1.1 connection. Each of these may either be a `CONNECT` request to establish a tunnel to an origin from the upstream proxy, or a absolute-form request which is forwarded to its origin by the upstream proxy.
 
 ## License
 
