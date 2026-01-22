@@ -144,7 +144,8 @@ impl UpstreamProxy {
             Err(reason) => {
                 debug!(?reason, "request is not authorized, abort");
                 HttpResponse::new(StatusCode::FORBIDDEN)
-                    .write(&mut send)
+                    .no_body()
+                    .write(&mut send, true)
                     .await
                     .ok();
                 send.finish().anyerr()?;
@@ -158,7 +159,8 @@ impl UpstreamProxy {
                     Err(err) => {
                         warn!("Failed to connect to origin server: {err:#}");
                         HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
-                            .write(&mut send)
+                            .no_body()
+                            .write(&mut send, true)
                             .await
                             .inspect_err(|err| {
                                 warn!("Failed to write error response to downstream: {err:#}")
@@ -170,7 +172,7 @@ impl UpstreamProxy {
                     Ok(tcp_stream) => {
                         debug!(%authority, "connected to origin");
                         HttpResponse::with_reason(StatusCode::OK, "Connection Established")
-                            .write(&mut send)
+                            .write(&mut send, true)
                             .await
                             .context("Failed to write CONNECT response to downstream")?;
                         let (mut origin_recv, mut origin_send) = tcp_stream.into_split();

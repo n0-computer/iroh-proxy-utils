@@ -1,8 +1,8 @@
 use std::{convert::Infallible, fmt::Debug, io, str::FromStr};
 
 use bytes::Bytes;
-use http::StatusCode;
-use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use http::{HeaderValue, StatusCode};
+use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
 use hyper::{
     Request, Response,
     body::{Frame, Incoming},
@@ -343,7 +343,6 @@ type HyperBody = BoxBody<Bytes, io::Error>;
 async fn http1_response_to_hyper(
     mut recv: Prebuffered<RecvStream>,
 ) -> Result<Response<HyperBody>, ProxyError> {
-    tracing::info!("downstream READING response");
     let response = HttpResponse::read(&mut recv)
         .await
         .map_err(ProxyError::bad_gateway)?;
@@ -351,9 +350,9 @@ async fn http1_response_to_hyper(
     let mut builder = Response::builder().status(response.status);
     let headers = builder.headers_mut().unwrap();
     for (name, value) in response.headers.iter() {
-        if should_drop_response_header(name) {
-            continue;
-        }
+        //     if should_drop_response_header(name) {
+        //         continue;
+        //     }
         headers.append(name, value.clone());
     }
     let body = recv_to_stream_body(recv).boxed();
@@ -362,19 +361,19 @@ async fn http1_response_to_hyper(
         .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
 }
 
-fn should_drop_request_header(name: &http::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
-    )
-}
+// fn should_drop_request_header(name: &http::HeaderName) -> bool {
+//     matches!(
+//         name.as_str(),
+//         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
+//     )
+// }
 
-fn should_drop_response_header(name: &http::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
-    )
-}
+// fn should_drop_response_header(name: &http::HeaderName) -> bool {
+//     matches!(
+//         name.as_str(),
+//         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
+//     )
+// }
 
 fn recv_to_stream_body(
     recv: Prebuffered<RecvStream>,
@@ -383,15 +382,18 @@ fn recv_to_stream_body(
 }
 
 fn h2_error_response(status: StatusCode) -> Response<HyperBody> {
-    let reason = status.canonical_reason().unwrap_or("");
-    let content = format!("{} {}", status.as_u16(), reason);
-    let body = Full::new(Bytes::from(content)).map_err(infallible_to_io);
-    Response::builder()
-        .status(status)
-        .body(body.boxed())
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::new()).map_err(infallible_to_io).boxed())
-        })
+    // let reason = status.canonical_reason().unwrap_or("");
+    // let content = format!("{} {}", status.as_u16(), reason);
+    let body = Empty::new().map_err(infallible_to_io);
+    let mut res = Response::builder().status(status);
+    res.headers_mut().unwrap().insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str("0").unwrap(),
+    );
+    res.body(body.boxed()).unwrap()
+    // .unwrap_or_else(|_| {
+    //     Response::new(Full::new(Bytes::new()).map_err(infallible_to_io).boxed())
+    // })
 }
 
 async fn pipe_h2_body(mut body: Incoming, send: &mut SendStream) -> Result<(), ProxyError> {

@@ -48,12 +48,24 @@ pub(crate) fn recv_to_stream(
     let (init, recv) = recv.into_parts();
     stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
         let item: io::Result<Bytes> = if let Some(init) = init.take() {
+            println!(
+                "RTS init: {} {}",
+                init.len(),
+                String::from_utf8_lossy(&init)
+            );
             Ok(init)
         } else {
             match recv.read_chunk(8192, true).await {
                 Err(err) => Err(err.into()),
                 Ok(None) => return None,
-                Ok(Some(chunk)) => Ok(chunk.bytes),
+                Ok(Some(chunk)) => {
+                    println!(
+                        "RTS chunk: {} {}",
+                        chunk.bytes.len(),
+                        String::from_utf8_lossy(&chunk.bytes)
+                    );
+                    Ok(chunk.bytes)
+                }
             }
         };
         Some((item, (None, recv)))

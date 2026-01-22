@@ -147,6 +147,7 @@ impl HttpRequest {
     pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
+            tracing::debug!(l=reader.buffer().len(), s=%String::from_utf8_lossy(reader.buffer()), "HttpRequest::peek");
             if let Some(request) = Self::parse_with_len(reader.buffer())? {
                 return Ok(request);
             }
@@ -253,15 +254,17 @@ impl HttpRequest {
         let (method, uri, headers) = self.into_parts();
         writer.write_all(method.as_str().as_bytes()).await?;
         writer.write_all(b" ").await?;
-        let uri_parts = uri.into_parts();
-        if let Some(s) = uri_parts.scheme {
+        if let Some(s) = uri.scheme() {
+            writer.write_all(s.as_str().as_bytes()).await?;
+            writer.write_all(b"://").await?;
+        }
+        if let Some(s) = uri.authority() {
             writer.write_all(s.as_str().as_bytes()).await?;
         }
-        if let Some(s) = uri_parts.authority {
-            writer.write_all(s.as_str().as_bytes()).await?;
-        }
-        if let Some(s) = uri_parts.path_and_query {
-            writer.write_all(s.as_str().as_bytes()).await?;
+        writer.write_all(uri.path().as_bytes()).await?;
+        if let Some(s) = uri.query() {
+            writer.write_all(b"?").await?;
+            writer.write_all(s.as_bytes()).await?;
         }
         writer.write_all(b" HTTP/1.1\r\n").await?;
         for (key, value) in headers.iter() {
@@ -332,16 +335,27 @@ impl HttpResponse {
         }
     }
 
+    pub(crate) fn no_body(mut self) -> Self {
+        self.headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str("0").unwrap(),
+        );
+        self
+    }
+
     pub(crate) async fn write(
         &self,
         writer: &mut (impl AsyncWrite + Send + Unpin),
+        finalize: bool,
     ) -> io::Result<()> {
         writer.write_all(self.status_line().as_bytes()).await?;
-        writer.write_all(b"\r\n").await?;
         for (key, value) in self.headers.iter() {
             writer.write_all(key.as_str().as_bytes()).await?;
             writer.write_all(b": ").await?;
             writer.write_all(value.as_bytes()).await?;
+            writer.write_all(b"\r\n").await?;
+        }
+        if finalize {
             writer.write_all(b"\r\n").await?;
         }
         Ok(())
@@ -412,14 +426,14 @@ impl HttpResponse {
     pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
-            if let Some(response) = Self::parse_with_len(reader.buffer())? {
-                return Ok(response);
-            }
             tracing::info!(
                 len = reader.buffer().len(),
                 b = %String::from_utf8_lossy(reader.buffer()),
                 "Response::peek"
-            )
+            );
+            if let Some(response) = Self::parse_with_len(reader.buffer())? {
+                return Ok(response);
+            }
         }
 
         Err(io::Error::new(

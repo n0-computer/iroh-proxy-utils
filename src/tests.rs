@@ -149,6 +149,7 @@ async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<(u1
         .timeout(Duration::from_secs(3))
         .await
         .anyerr()??;
+    debug!("RESPONSE {}", String::from_utf8_lossy(&buf));
     let (header_len, response) =
         HttpResponse::parse_with_len(&buf)?.context("Incomplete HTTP response")?;
     Ok((response.status.as_u16(), buf[header_len..].to_vec()))
@@ -535,6 +536,7 @@ async fn test_upstream_auth_endpoint() -> Result {
     // Should fail (error status or connection closed)
     let (status, body) = read_http_response(&mut stream2).await?;
     assert_eq!(status, 403);
+    println!("BODY {}", String::from_utf8_lossy(&body));
     assert!(body.is_empty());
 
     drop(proxy_task);
@@ -953,6 +955,7 @@ async fn h2_multiple_connect_requests_single_connection() -> Result<()> {
 mod origin_server {
     use std::{convert::Infallible, sync::Arc};
 
+    use http::HeaderValue;
     use http_body_util::{BodyExt, Full};
     use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
@@ -974,7 +977,14 @@ mod origin_server {
                     debug!("origin {label}: {req:?}");
                     async move {
                         let body = format!("{} {} {}", *label, req.method(), req.uri().path());
-                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
+                        let len = body.len();
+                        let mut res = Response::new(Full::new(Bytes::from(body)));
+                        res.headers_mut().insert(
+                            http::header::CONTENT_LENGTH,
+                            HeaderValue::from_str(&len.to_string()).unwrap(),
+                        );
+
+                        Ok::<_, Infallible>(res)
                     }
                 };
                 let _ = http1::Builder::new()
