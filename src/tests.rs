@@ -900,6 +900,56 @@ async fn test_forward_and_reverse_combined() -> Result {
     Ok(())
 }
 
+#[tokio::test]
+#[traced_test]
+async fn h2_multiple_connect_requests_single_connection() -> Result<()> {
+    use bytes::Bytes;
+    use http::header::HOST;
+    use http_body_util::{BodyExt, Full};
+    use hyper::{Method, Request};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_echo_server().await?;
+    let opts = HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id));
+    let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(ProxyMode::Http(opts)).await?;
+
+    let stream = TcpStream::connect(proxy_addr).await?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .anyerr()?;
+    let conn_task = tokio::spawn(async move { conn.await });
+
+    let authority = origin_addr.to_string();
+    let req1 = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&authority)
+        .header(HOST, authority.clone())
+        .body(Full::new(Bytes::from_static(b"alpha")))
+        .anyerr()?;
+    let res1 = sender.send_request(req1).await.anyerr()?;
+    assert_eq!(res1.status(), StatusCode::OK);
+    let body1 = res1.into_body().collect().await.anyerr()?.to_bytes();
+    assert_eq!(body1.as_ref(), b"alpha");
+
+    let req2 = Request::builder()
+        .method(Method::CONNECT)
+        .uri(&authority)
+        .header(HOST, authority.clone())
+        .body(Full::new(Bytes::from_static(b"beta")))
+        .anyerr()?;
+    let res2 = sender.send_request(req2).await.anyerr()?;
+    assert_eq!(res2.status(), StatusCode::OK);
+    let body2 = res2.into_body().collect().await.anyerr()?.to_bytes();
+    assert_eq!(body2.as_ref(), b"beta");
+
+    drop(proxy_task);
+    conn_task.abort();
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
 mod origin_server {
     use std::{convert::Infallible, sync::Arc};
 
@@ -907,6 +957,7 @@ mod origin_server {
     use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener;
+    use tracing::debug;
 
     /// Returns "{label} {METHOD} {PATH}" as response body.
     pub(super) async fn run(listener: TcpListener, label: &'static str) {
@@ -920,6 +971,7 @@ mod origin_server {
             tokio::task::spawn(async move {
                 let handler = move |req: Request<hyper::body::Incoming>| {
                     let label = label.clone();
+                    debug!("origin {label}: {req:?}");
                     async move {
                         let body = format!("{} {} {}", *label, req.method(), req.uri().path());
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))

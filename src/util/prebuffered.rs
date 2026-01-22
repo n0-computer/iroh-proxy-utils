@@ -66,7 +66,14 @@ impl<R: AsyncRead + Unpin> Prebuffered<R> {
             .take(max as u64)
             .read_buf(&mut self.buf)
             .await?;
-        Ok(n)
+        if n == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "wanted to buffer more but stream closed",
+            ))
+        } else {
+            Ok(n)
+        }
     }
 
     /// Returns the buffer and the inner reader.

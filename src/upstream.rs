@@ -1,5 +1,4 @@
 use std::{
-    io,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -7,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
 use http::StatusCode;
 use iroh::{
     EndpointId,
@@ -15,7 +13,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use n0_error::{Result, StackResultExt, StdResultExt};
-use n0_future::stream::{self, StreamExt};
+use n0_future::stream::StreamExt;
 use tokio::net::TcpStream;
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, error_span, instrument, warn};
@@ -23,7 +21,7 @@ use tracing::{Instrument, debug, error_span, instrument, warn};
 use crate::{
     HEADER_SECTION_MAX_LENGTH, HttpResponse,
     parse::{HttpProxyRequestKind, HttpRequest},
-    util::{Prebuffered, forward_bidi},
+    util::{Prebuffered, forward_bidi, recv_to_stream},
 };
 
 mod auth;
@@ -176,7 +174,7 @@ impl UpstreamProxy {
                             .await
                             .context("Failed to write CONNECT response to downstream")?;
                         let (mut origin_recv, mut origin_send) = tcp_stream.into_split();
-                        forward_bidi(&mut origin_recv, &mut origin_send, &mut recv, &mut send)
+                        forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send)
                             .await?;
                         Ok(())
                     }
@@ -209,20 +207,7 @@ impl UpstreamProxy {
 
 // Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].
 fn recv_stream_to_body(recv: Prebuffered<RecvStream>) -> reqwest::Body {
-    let (init, recv) = recv.into_parts();
-    let body = stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
-        let item: io::Result<Bytes> = if let Some(init) = init.take() {
-            Ok(init)
-        } else {
-            match recv.read_chunk(8192, true).await {
-                Err(err) => Err(err.into()),
-                Ok(None) => return None,
-                Ok(Some(chunk)) => Ok(chunk.bytes),
-            }
-        };
-        Some((item, (None, recv)))
-    });
-    reqwest::Body::wrap_stream(body)
+    reqwest::Body::wrap_stream(recv_to_stream(recv))
 }
 
 async fn write_response_header(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {

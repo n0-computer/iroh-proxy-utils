@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use http::{
-    HeaderValue, Method, StatusCode,
+    HeaderMap, HeaderValue, Method, StatusCode,
     uri::{Scheme, Uri},
 };
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
@@ -112,7 +112,7 @@ pub struct HttpProxyRequest {
     /// Parsed proxy request target.
     pub kind: HttpProxyRequestKind,
     /// Raw header map as received.
-    pub headers: http::HeaderMap<http::HeaderValue>,
+    pub headers: HeaderMap<http::HeaderValue>,
 }
 
 /// Parsed HTTP request with headers and request target classification.
@@ -129,7 +129,7 @@ pub struct HttpOriginRequest {
     /// HTTP method from the request line.
     pub method: Method,
     /// Raw header map as received.
-    pub headers: http::HeaderMap<http::HeaderValue>,
+    pub headers: HeaderMap<http::HeaderValue>,
 }
 
 impl HttpOriginRequest {
@@ -189,16 +189,24 @@ impl HttpRequest {
         }
     }
 
-    fn from_request(req: httparse::Request) -> Result<Self> {
+    pub fn from_request(req: httparse::Request) -> Result<Self> {
         let method_str = req.method.context("Missing HTTP method")?;
         let method = method_str.parse().std_context("Invalid HTTP method")?;
         let path = req.path.context("Missing request target")?;
         let uri = Uri::from_str(path).std_context("Invalid request target")?;
-        let headers = http::HeaderMap::from_iter(req.headers.iter_mut().flat_map(|h| {
+        let headers = HeaderMap::from_iter(req.headers.iter_mut().flat_map(|h| {
             let value = HeaderValue::from_bytes(h.value).ok()?;
             let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
             Some((name, value))
         }));
+        Self::from_parts(method, uri, headers)
+    }
+
+    pub fn from_http_parts(parts: http::request::Parts) -> Result<Self> {
+        Self::from_parts(parts.method, parts.uri, parts.headers)
+    }
+
+    pub fn from_parts(method: Method, uri: Uri, headers: HeaderMap<HeaderValue>) -> Result<Self> {
         let request = match method {
             Method::CONNECT => {
                 let authority = Authority::from_authority_uri(&uri)?;
@@ -211,14 +219,14 @@ impl HttpRequest {
                 if uri.scheme().is_some() {
                     Self::Forward(HttpProxyRequest {
                         kind: HttpProxyRequestKind::Absolute {
-                            target: path.to_string(),
+                            target: uri.to_string(),
                             method,
                         },
                         headers,
                     })
                 } else {
                     Self::Origin(HttpOriginRequest {
-                        path: path.to_string(),
+                        path: uri.to_string(),
                         method,
                         headers,
                     })
@@ -237,6 +245,63 @@ impl HttpRequest {
             Self::Origin(_) => Err(anyerr!("Request is origin-form and not a proxy request")),
         }
     }
+
+    pub(crate) async fn write(
+        self,
+        writer: &mut (impl AsyncWrite + Send + Unpin),
+    ) -> io::Result<()> {
+        let (method, uri, headers) = self.into_parts();
+        writer.write_all(method.as_str().as_bytes()).await?;
+        writer.write_all(b" ").await?;
+        let uri_parts = uri.into_parts();
+        if let Some(s) = uri_parts.scheme {
+            writer.write_all(s.as_str().as_bytes()).await?;
+        }
+        if let Some(s) = uri_parts.authority {
+            writer.write_all(s.as_str().as_bytes()).await?;
+        }
+        if let Some(s) = uri_parts.path_and_query {
+            writer.write_all(s.as_str().as_bytes()).await?;
+        }
+        writer.write_all(b" HTTP/1.1\r\n").await?;
+        for (key, value) in headers.iter() {
+            writer.write_all(key.as_str().as_bytes()).await?;
+            writer.write_all(b": ").await?;
+            writer.write_all(value.as_bytes()).await?;
+            writer.write_all(b"\r\n").await?;
+        }
+        writer.write_all(b"\r\n").await?;
+        writer.write_all(b"\r\n").await?;
+        Ok(())
+    }
+
+    pub fn into_parts(self) -> (Method, Uri, HeaderMap<HeaderValue>) {
+        let (method, uri, headers) = match self {
+            HttpRequest::Forward(HttpProxyRequest { kind, headers }) => match kind {
+                HttpProxyRequestKind::Tunnel { target } => {
+                    let uri = Uri::try_from(target.to_string()).unwrap();
+                    (Method::CONNECT, uri, headers)
+                }
+                HttpProxyRequestKind::Absolute { target, method } => {
+                    let uri = Uri::try_from(target).unwrap();
+                    (method, uri, headers)
+                }
+            },
+            HttpRequest::Origin(HttpOriginRequest {
+                path,
+                method,
+                headers,
+            }) => {
+                let uri = Uri::try_from(path).unwrap_or_default();
+                (method, uri, headers)
+            }
+        };
+        (method, uri, headers)
+        // let mut builder = http::Request::builder().method(method).uri(uri);
+        // let builder_headers = builder.headers_mut().unwrap();
+        // *builder_headers = headers;
+        // builder
+    }
 }
 
 /// Parsed HTTP response with status, reason, and headers.
@@ -247,7 +312,7 @@ pub struct HttpResponse {
     /// Reason phrase if present.
     pub reason: Option<String>,
     /// Raw header map as received.
-    pub headers: http::HeaderMap<http::HeaderValue>,
+    pub headers: HeaderMap<http::HeaderValue>,
 }
 
 impl HttpResponse {
@@ -255,7 +320,7 @@ impl HttpResponse {
         Self {
             status,
             reason: None,
-            headers: http::HeaderMap::new(),
+            headers: HeaderMap::new(),
         }
     }
 
@@ -263,7 +328,7 @@ impl HttpResponse {
         Self {
             status,
             reason: Some(reason.to_string()),
-            headers: http::HeaderMap::new(),
+            headers: HeaderMap::new(),
         }
     }
 
@@ -323,7 +388,7 @@ impl HttpResponse {
                 let status =
                     StatusCode::from_u16(code).std_context("Invalid response status code")?;
                 let reason = res.reason.map(ToOwned::to_owned);
-                let headers = http::HeaderMap::from_iter(res.headers.iter().flat_map(|h| {
+                let headers = HeaderMap::from_iter(res.headers.iter().flat_map(|h| {
                     let value = HeaderValue::from_bytes(h.value).ok()?;
                     let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
                     Some((name, value))
@@ -350,6 +415,11 @@ impl HttpResponse {
             if let Some(response) = Self::parse_with_len(reader.buffer())? {
                 return Ok(response);
             }
+            tracing::info!(
+                len = reader.buffer().len(),
+                b = %String::from_utf8_lossy(reader.buffer()),
+                "Response::peek"
+            )
         }
 
         Err(io::Error::new(
@@ -360,6 +430,8 @@ impl HttpResponse {
     }
 
     /// Reads and parses the response status line and header section.
+    ///
+    /// Removes the header section from the reader.
     pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
         let (len, response) = Self::peek(reader).await?;
         reader.discard(len);

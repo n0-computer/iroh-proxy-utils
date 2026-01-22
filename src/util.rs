@@ -1,4 +1,9 @@
+use std::io;
+
+use bytes::Bytes;
+use iroh::endpoint::RecvStream;
 use n0_error::{Result, StackResultExt};
+use n0_future::{Stream, stream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
@@ -34,4 +39,23 @@ pub(crate) async fn forward_bidi(
     let r1 = r1.context("failed to copy down-to-up")?;
     let r2 = r2.context("failed to copy up-to-down")?;
     Ok((r1, r2))
+}
+
+// Converts a [`Prebuffered`] recv stream into a stream of [`Bytes`].
+pub(crate) fn recv_to_stream(
+    recv: Prebuffered<RecvStream>,
+) -> impl Stream<Item = io::Result<Bytes>> {
+    let (init, recv) = recv.into_parts();
+    stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
+        let item: io::Result<Bytes> = if let Some(init) = init.take() {
+            Ok(init)
+        } else {
+            match recv.read_chunk(8192, true).await {
+                Err(err) => Err(err.into()),
+                Ok(None) => return None,
+                Ok(Some(chunk)) => Ok(chunk.bytes),
+            }
+        };
+        Some((item, (None, recv)))
+    })
 }
