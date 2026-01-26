@@ -7,7 +7,7 @@ use http::{
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::util::Prebuffered;
+use crate::{downstream::EndpointAuthority, util::Prebuffered};
 
 /// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]
@@ -135,6 +135,17 @@ pub struct HttpOriginRequest {
 impl HttpOriginRequest {
     pub fn host(&self) -> Option<&str> {
         self.headers.get("host").and_then(|x| x.to_str().ok())
+    }
+
+    pub fn to_absolute(self, destination: &EndpointAuthority) -> HttpProxyRequest {
+        let absolute_uri = format!("http://{}{}", destination.authority, self.path);
+        HttpProxyRequest {
+            kind: HttpProxyRequestKind::Absolute {
+                target: absolute_uri,
+                method: self.method,
+            },
+            headers: self.headers,
+        }
     }
 }
 
@@ -274,9 +285,17 @@ impl HttpRequest {
             writer.write_all(b"\r\n").await?;
         }
         writer.write_all(b"\r\n").await?;
-        writer.write_all(b"\r\n").await?;
         Ok(())
     }
+
+    // pub(crate) async fn write_finalize(
+    //     self,
+    //     writer: &mut (impl AsyncWrite + Send + Unpin),
+    // ) -> io::Result<()> {
+    //     self.write(writer).await?;
+    //     writer.write_all(b"\r\n").await?;
+    //     Ok(())
+    // }
 
     pub fn into_parts(self) -> (Method, Uri, HeaderMap<HeaderValue>) {
         let (method, uri, headers) = match self {

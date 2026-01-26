@@ -124,9 +124,8 @@ mod tests {
     #[tokio::test]
     async fn buffer_more_eof() {
         let mut p = Prebuffered::unlimited(cursor(b""));
-        let n = p.buffer_more().await.unwrap();
-        assert_eq!(n, 0);
-        assert_eq!(p.buffer(), b"");
+        let err = p.buffer_more().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
@@ -135,7 +134,8 @@ mod tests {
         p.buffer_more().await.unwrap();
         p.discard(p.len());
         assert_eq!(p.buffer(), b"");
-        assert_eq!(p.buffer_more().await.unwrap(), 0);
+        let err = p.buffer_more().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

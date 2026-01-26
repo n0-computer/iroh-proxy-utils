@@ -16,10 +16,10 @@ mod prebuffered;
 ///
 /// Calls `finish` on the SendStream once done.
 pub(crate) async fn forward_bidi(
-    downstream_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    downstream_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
-    upstream_recv: &mut (impl AsyncRead + Send + Sync + Unpin),
-    upstream_send: &mut (impl AsyncWrite + Send + Sync + Unpin),
+    downstream_recv: &mut (impl AsyncRead + Send + Unpin),
+    downstream_send: &mut (impl AsyncWrite + Send + Unpin),
+    upstream_recv: &mut (impl AsyncRead + Send + Unpin),
+    upstream_send: &mut (impl AsyncWrite + Send + Unpin),
 ) -> Result<(u64, u64)> {
     let start = n0_future::time::Instant::now();
     let (r1, r2) = tokio::join!(
@@ -48,24 +48,12 @@ pub(crate) fn recv_to_stream(
     let (init, recv) = recv.into_parts();
     stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
         let item: io::Result<Bytes> = if let Some(init) = init.take() {
-            println!(
-                "RTS init: {} {}",
-                init.len(),
-                String::from_utf8_lossy(&init)
-            );
             Ok(init)
         } else {
             match recv.read_chunk(8192, true).await {
                 Err(err) => Err(err.into()),
                 Ok(None) => return None,
-                Ok(Some(chunk)) => {
-                    println!(
-                        "RTS chunk: {} {}",
-                        chunk.bytes.len(),
-                        String::from_utf8_lossy(&chunk.bytes)
-                    );
-                    Ok(chunk.bytes)
-                }
+                Ok(Some(chunk)) => Ok(chunk.bytes),
             }
         };
         Some((item, (None, recv)))
