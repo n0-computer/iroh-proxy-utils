@@ -18,10 +18,10 @@ use iroh::{
 };
 use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
 use n0_error::{AnyError, Result, anyerr, stack_error};
-use n0_future::{TryStreamExt, stream::Stream};
+use n0_future::TryStreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error_span, warn};
+use tracing::{Instrument, debug, error_span, info, warn};
 
 pub use self::opts::{
     Deny, ErrorResponder, HttpProxyOpts, PoolOpts, ProxyMode, RequestHandler, RequestHandlerChain,
@@ -246,8 +246,11 @@ impl DownstreamProxy {
                     warn!("failed to forward request body to upstream: {err:#}");
                 }
             });
-            let response = read_http1_response_to_hyper(conn.recv).await?;
-            Ok(response)
+            let response = HttpResponse::read(&mut conn.recv)
+                .await
+                .map_err(ProxyError::bad_gateway)?;
+            info!(?response, "downstream read response");
+            http1_response_to_hyper(response, conn.recv)
         }
     }
 }
@@ -356,52 +359,17 @@ impl ProxyError {
 
 type HyperBody = BoxBody<Bytes, io::Error>;
 
-async fn read_http1_response_to_hyper(
-    mut recv: Prebuffered<RecvStream>,
-) -> Result<Response<HyperBody>, ProxyError> {
-    let response = HttpResponse::read(&mut recv)
-        .await
-        .map_err(ProxyError::bad_gateway)?;
-    tracing::info!(?response, "downstream read response");
-    http1_response_to_hyper(response, recv)
-}
-
 fn http1_response_to_hyper(
     response: HttpResponse,
     recv: Prebuffered<RecvStream>,
 ) -> Result<Response<HyperBody>, ProxyError> {
     let mut builder = Response::builder().status(response.status);
     let headers = builder.headers_mut().unwrap();
-    for (name, value) in response.headers.iter() {
-        //     if should_drop_response_header(name) {
-        //         continue;
-        //     }
-        headers.append(name, value.clone());
-    }
-    let body = recv_to_stream_body(recv).boxed();
+    *headers = response.headers;
+    let body = StreamBody::new(recv_to_stream(recv).map_ok(Frame::data)).boxed();
     builder
         .body(body)
         .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
-}
-
-// fn should_drop_request_header(name: &http::HeaderName) -> bool {
-//     matches!(
-//         name.as_str(),
-//         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
-//     )
-// }
-
-// fn should_drop_response_header(name: &http::HeaderName) -> bool {
-//     matches!(
-//         name.as_str(),
-//         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
-//     )
-// }
-
-fn recv_to_stream_body(
-    recv: Prebuffered<RecvStream>,
-) -> StreamBody<impl Stream<Item = io::Result<Frame<Bytes>>>> {
-    StreamBody::new(recv_to_stream(recv).map_ok(Frame::data))
 }
 
 fn h2_error_response(status: StatusCode) -> Response<HyperBody> {
