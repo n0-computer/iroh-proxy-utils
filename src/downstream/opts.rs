@@ -54,10 +54,6 @@ pub enum ProxyMode {
 pub struct HttpProxyOpts {
     #[debug("DynRequestHandler")]
     pub(crate) request_handler: Arc<DynRequestHandler<'static>>,
-    // /// Forward-proxy mode for CONNECT authority-form and absolute-form requests.
-    // forward: Option<ForwardProxyMode>,
-    // /// Reverse-proxy mode for origin-form requests.
-    // reverse: Option<ReverseProxyMode>,
     #[debug("{:?}", response_writer.as_ref().map(|_| "DynWriteErrorResponse"))]
     response_writer: Option<Arc<DynErrorResponder<'static>>>,
 }
