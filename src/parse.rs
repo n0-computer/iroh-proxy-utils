@@ -254,9 +254,15 @@ impl HttpRequest {
     }
 
     pub fn host(&self) -> Option<&str> {
-        self.headers
-            .get(http::header::HOST)
-            .and_then(|x| x.to_str().ok())
+        if self.version >= Version::HTTP_2 {
+            self.uri.host()
+        } else {
+            self.header_str(http::header::HOST)
+        }
+    }
+
+    pub fn header_str(&self, name: impl AsHeaderName) -> Option<&str> {
+        self.headers.get(name).and_then(|x| x.to_str().ok())
     }
 
     /// Classify into a kind based on the request kind.
