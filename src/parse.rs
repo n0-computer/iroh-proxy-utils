@@ -55,13 +55,16 @@ pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
     }
 }
 
-/// Host and port authority parsed from HTTP request targets.
+/// Host and port extracted from HTTP request targets (RFC 9110 §7.2).
+///
+/// Represents the authority component of a URI, containing the host (domain name
+/// or IP address) and port number. Used for routing proxy requests to origin servers.
 #[derive(Debug, Clone, derive_more::Display)]
 #[display("{host}:{port}")]
 pub struct Authority {
-    /// Hostname or IP literal without scheme.
+    /// Hostname or IP literal (without brackets for IPv6).
     pub host: String,
-    /// Port number in host byte order.
+    /// Port number.
     pub port: u16,
 }
 
@@ -73,13 +76,18 @@ impl FromStr for Authority {
 }
 
 impl Authority {
+    /// Creates an authority from host and port components.
     pub fn new(host: String, port: u16) -> Self {
         Self { host, port }
     }
 
-    /// Parses an authority-form URI with no scheme and no path.
+    /// Parses an authority-form request target (RFC 9110 §7.1).
     ///
-    /// Note: the URI must include a port.
+    /// Authority-form is used with CONNECT requests: `host:port` with no scheme or path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URI contains a scheme, path, or lacks a port.
     pub fn from_authority_uri(uri: &Uri) -> Result<Self> {
         ensure_any!(uri.scheme().is_none(), "Expected URI without scheme");
         ensure_any!(uri.path_and_query().is_none(), "Expected URI without path");
@@ -92,9 +100,15 @@ impl Authority {
         })
     }
 
-    /// Parses an absolute-form URI and infers the port from the scheme.
+    /// Parses an absolute-form request target (RFC 9110 §7.1).
     ///
-    /// Note: if no port is present, only `http` and `https` schemes are accepted.
+    /// Absolute-form includes scheme, host, and optional port: `http://host:port/path`.
+    /// If no port is specified, defaults to 80 for HTTP or 443 for HTTPS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URI lacks an authority or has an unsupported scheme
+    /// without an explicit port.
     pub fn from_absolute_uri(uri: &Uri) -> Result<Self> {
         let authority = uri.authority().context("Expected URI with authority")?;
         let host = authority.host();
@@ -112,12 +126,16 @@ impl Authority {
         })
     }
 
-    /// Parses an authority-form request target from a string.
+    /// Parses an authority-form string (`host:port`).
+    ///
+    /// See [`from_authority_uri`](Self::from_authority_uri) for details.
     pub fn from_authority_str(s: &str) -> Result<Self> {
         Self::from_authority_uri(&Uri::from_str(s).std_context("Invalid authority string")?)
     }
 
-    /// Parses an absolute-form request target from a string.
+    /// Parses an absolute-form URI string.
+    ///
+    /// See [`from_absolute_uri`](Self::from_absolute_uri) for details.
     pub fn from_absolute_uri_str(s: &str) -> Result<Self> {
         Self::from_absolute_uri(&Uri::from_str(s).std_context("Invalid authority string")?)
     }
@@ -133,11 +151,19 @@ impl Authority {
     }
 }
 
+/// Parsed HTTP request with method, URI, headers, and version.
+///
+/// Contains the request-line and header section of an HTTP message (RFC 9110 §6).
+/// The message body is handled separately via streaming.
 #[derive(Debug)]
 pub struct HttpRequest {
+    /// HTTP version (e.g., HTTP/1.1, HTTP/2).
     pub version: Version,
+    /// Header fields from the request.
     pub headers: HeaderMap<HeaderValue>,
+    /// Request target URI.
     pub uri: Uri,
+    /// HTTP method (GET, POST, CONNECT, etc.).
     pub method: Method,
 }
 
@@ -145,6 +171,7 @@ const X_FORWARDED_FOR: &str = "x-forwarded-for";
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
 
 impl HttpRequest {
+    /// Creates a request from hyper request parts.
     pub fn from_parts(parts: http::request::Parts) -> Self {
         Self {
             version: parts.version,
@@ -154,9 +181,10 @@ impl HttpRequest {
         }
     }
 
-    /// Parses a request from a buffer and returns `None` when incomplete.
+    /// Parses a request from a buffer, returning `None` if incomplete.
     ///
-    /// Returns the length of the header section and the request.
+    /// On success, returns the byte length consumed and the parsed request.
+    /// Use this for incremental parsing when data arrives in chunks.
     pub fn parse_with_len(buf: &[u8]) -> Result<Option<(usize, Self)>> {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
@@ -168,6 +196,7 @@ impl HttpRequest {
         }
     }
 
+    /// Converts from an `httparse::Request` after successful parsing.
     pub fn from_parsed_request(req: httparse::Request) -> Result<Self> {
         let method_str = req.method.context("Missing HTTP method")?;
         let method = method_str.parse().std_context("Invalid HTTP method")?;
@@ -220,16 +249,17 @@ impl HttpRequest {
         Ok(response)
     }
 
-    /// Parses a request from a buffer and returns `None` when incomplete.
-    ///
-    /// Returns the length of the header section and the request.
+    /// Parses a request from a buffer, returning `None` if incomplete.
     pub fn parse(buf: &[u8]) -> Result<Option<Self>> {
         Ok(Self::parse_with_len(buf)?.map(|(_len, req)| req))
     }
 
-    /// Converts to a proxy request when the target is authority-form or absolute-form.
+    /// Converts to a proxy request for authority-form or absolute-form targets.
     ///
-    /// Note: origin-form requests return an error.
+    /// # Errors
+    ///
+    /// Returns an error for origin-form requests (`GET /path`), which lack
+    /// routing information for forward proxies.
     pub fn try_into_proxy_request(self) -> Result<HttpProxyRequest> {
         let kind = match self.method {
             Method::CONNECT => {
@@ -253,6 +283,10 @@ impl HttpRequest {
         })
     }
 
+    /// Returns the target host from the request.
+    ///
+    /// For HTTP/2+, extracts from the `:authority` pseudo-header (via URI).
+    /// For HTTP/1.x, extracts from the `Host` header field.
     pub fn host(&self) -> Option<&str> {
         if self.version >= Version::HTTP_2 {
             self.uri.host()
@@ -261,14 +295,16 @@ impl HttpRequest {
         }
     }
 
+    /// Returns a header value as a string, if present and valid UTF-8.
     pub fn header_str(&self, name: impl AsHeaderName) -> Option<&str> {
         self.headers.get(name).and_then(|x| x.to_str().ok())
     }
 
-    /// Classify into a kind based on the request kind.
+    /// Classifies the request by its target form (RFC 9110 §7.1).
     ///
-    /// Returns an error for invalid combinations:
-    /// - CONNECT request without authority-form target
+    /// # Errors
+    ///
+    /// Returns an error if a CONNECT request lacks a valid authority-form target.
     pub fn classify(&self) -> Result<HttpRequestKind> {
         match self.method {
             Method::CONNECT => {
@@ -294,6 +330,10 @@ impl HttpRequest {
         }
     }
 
+    /// Appends an `X-Forwarded-For` header with the client address.
+    ///
+    /// Per the de facto standard, this identifies the originating client IP
+    /// for requests forwarded through proxies.
     pub fn set_forwarded_for(&mut self, src_addr: SocketAddr) -> &mut Self {
         self.headers.append(
             X_FORWARDED_FOR,
@@ -302,6 +342,7 @@ impl HttpRequest {
         self
     }
 
+    /// Removes the specified headers from the request.
     pub fn remove_headers(
         &mut self,
         names: impl IntoIterator<Item = impl AsHeaderName>,
@@ -312,6 +353,9 @@ impl HttpRequest {
         self
     }
 
+    /// Appends a `Via` header indicating this proxy (RFC 9110 §7.6.3).
+    ///
+    /// The header value includes the protocol version and the given pseudonym.
     pub fn set_via(
         &mut self,
         pseudonym: impl std::fmt::Display,
@@ -323,6 +367,9 @@ impl HttpRequest {
         Ok(self)
     }
 
+    /// Sets the request target URI and updates the `Host` header.
+    ///
+    /// The original `Host` value is preserved in `X-Forwarded-Host`.
     pub fn set_target(&mut self, target: Uri) -> Result<&mut Self, InvalidHeaderValue> {
         if let Some(original_host) = self.headers.remove(header::HOST) {
             self.headers.insert(X_FORWARDED_HOST, original_host);
@@ -335,6 +382,10 @@ impl HttpRequest {
         Ok(self)
     }
 
+    /// Converts the request to absolute-form with the given authority.
+    ///
+    /// Sets the scheme to HTTP and updates the `Host` header to match.
+    /// Used by reverse proxies to transform origin-form requests.
     pub fn set_absolute_http_authority(&mut self, authority: Authority) -> Result<&mut Self> {
         let mut parts = self.uri.clone().into_parts();
         parts.authority = Some(authority.to_string().parse().anyerr()?);
@@ -380,39 +431,60 @@ impl HttpRequest {
     }
 }
 
+/// Classification of HTTP request target forms (RFC 9110 §7.1).
 #[derive(Debug, Eq, PartialEq)]
 pub enum HttpRequestKind {
+    /// CONNECT method with authority-form target (`host:port`).
     Tunnel,
+    /// Request with absolute-form target (`http://host/path`).
     Absolute,
+    /// Request with origin-form target (`/path`).
     Origin,
 }
 
-/// Proxy request targets per RFC 9110.
+/// Proxy-specific request target classification (RFC 9110 §7.1).
+///
+/// Distinguishes between CONNECT tunneling and absolute-form forwarding,
+/// both of which are valid for forward proxies.
 #[derive(Debug)]
 pub enum HttpProxyRequestKind {
-    /// Tunnel CONNECT request with authority-form request target.
-    Tunnel { target: Authority },
-    /// Forward-proxy request with absolute-form request target.
-    Absolute { target: String, method: Method },
+    /// CONNECT tunnel request with authority-form target.
+    Tunnel {
+        /// The `host:port` to tunnel to.
+        target: Authority,
+    },
+    /// Forward proxy request with absolute-form target.
+    Absolute {
+        /// The full target URL.
+        target: String,
+        /// The HTTP method.
+        method: Method,
+    },
 }
 
-/// Parsed HTTP proxy request with headers.
+/// HTTP request suitable for proxy routing decisions.
+///
+/// Contains the classified request target and headers. The body is
+/// handled separately via streaming.
 #[derive(derive_more::Debug)]
 pub struct HttpProxyRequest {
-    /// Parsed proxy request target.
+    /// Classified request target.
     pub kind: HttpProxyRequestKind,
-    /// Raw header map as received.
+    /// Header fields from the request.
     pub headers: HeaderMap<http::HeaderValue>,
 }
 
-/// Parsed HTTP response with status, reason, and headers.
+/// Parsed HTTP response with status line and headers.
+///
+/// Contains the status-line and header section of an HTTP response (RFC 9110 §6).
+/// The message body is handled separately via streaming.
 #[derive(derive_more::Debug)]
 pub struct HttpResponse {
-    /// Status code from the response line.
+    /// HTTP status code (e.g., 200, 404, 502).
     pub status: StatusCode,
-    /// Reason phrase if present.
+    /// Reason phrase from the status line, if present.
     pub reason: Option<String>,
-    /// Raw header map as received.
+    /// Header fields from the response.
     pub headers: HeaderMap<http::HeaderValue>,
 }
 
@@ -459,7 +531,7 @@ impl HttpResponse {
         Ok(())
     }
 
-    /// Returns the reason phrase or a canonical reason if available.
+    /// Returns the reason phrase, falling back to the canonical phrase for the status code.
     pub fn reason(&self) -> &str {
         self.reason
             .as_deref()
@@ -467,7 +539,7 @@ impl HttpResponse {
             .unwrap_or("")
     }
 
-    /// Formats a status line suitable for an HTTP/1.x response.
+    /// Formats an HTTP/1.1 status line (e.g., `HTTP/1.1 200 OK\r\n`).
     pub fn status_line(&self) -> String {
         format!(
             "HTTP/1.1 {} {}\r\n",

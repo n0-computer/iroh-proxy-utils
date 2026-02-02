@@ -13,10 +13,15 @@ use crate::{
     parse::HttpRequest,
 };
 
-/// Options for the downstream connection pool.
+/// Configuration for the upstream connection pool.
+///
+/// Controls timeouts for establishing new connections and keeping idle
+/// connections alive.
 #[derive(Debug, Clone)]
 pub struct PoolOpts {
+    /// Maximum time to wait when establishing a new connection.
     pub connect_timeout: Duration,
+    /// How long to keep idle connections open before closing them.
     pub idle_timeout: Duration,
 }
 
@@ -39,17 +44,25 @@ impl From<PoolOpts> for connection_pool::Options {
     }
 }
 
-/// Determines how the proxy deals with incoming TCP connections.
+/// Operating mode for the downstream proxy.
 #[derive(derive_more::Debug, Clone)]
 pub enum ProxyMode {
-    /// TCP mode blindly forwards all incoming TCP connections over a tunnel to a fixed remote authority.
+    /// TCP tunneling mode.
+    ///
+    /// All incoming connections are tunneled to a fixed upstream endpoint and
+    /// authority without any HTTP parsing. Suitable for non-HTTP protocols or
+    /// when dynamic routing is not needed.
     Tcp(EndpointAuthority),
-    /// HTTP mode reads the header section of the HTTP request on incoming TCP connections, and thus
-    /// can use the request data to decide over the destination.
+    /// HTTP-aware proxy mode.
+    ///
+    /// Parses HTTP requests to enable dynamic routing based on request content.
+    /// Supports both HTTP/1.1 and HTTP/2, including CONNECT tunneling.
     Http(HttpProxyOpts),
 }
 
-/// Policy for handling forward and reverse proxy requests.
+/// Configuration for HTTP proxy mode.
+///
+/// Specifies how requests are routed and how errors are reported to clients.
 #[derive(derive_more::Debug, Clone)]
 pub struct HttpProxyOpts {
     #[debug("DynRequestHandler")]
@@ -59,6 +72,7 @@ pub struct HttpProxyOpts {
 }
 
 impl HttpProxyOpts {
+    /// Creates HTTP proxy options with the given request handler.
     pub fn new(request_handler: impl RequestHandler + 'static) -> Self {
         Self {
             request_handler: DynRequestHandler::new_arc(request_handler),
@@ -66,9 +80,10 @@ impl HttpProxyOpts {
         }
     }
 
-    /// Installs a custom error response writer for downstream-facing responses.
+    /// Sets a custom error response generator.
     ///
-    /// Note: if not set, a minimal `text/plain` response is emitted.
+    /// When proxy errors occur, this responder generates the HTTP response
+    /// sent to the client. If not set, a minimal empty response is used.
     pub fn error_responder(mut self, writer: impl ErrorResponder + 'static) -> Self {
         self.response_writer = Some(DynErrorResponder::new_arc(writer));
         self
@@ -87,9 +102,12 @@ impl HttpProxyOpts {
 }
 
 #[dynosaur(DynErrorResponder = dyn(box) ErrorResponder)]
-/// Writes an HTTP error response to a downstream TCP stream.
+/// Generates HTTP error responses for proxy failures.
+///
+/// Implement this trait to customize error pages shown to clients when
+/// proxy operations fail.
 pub trait ErrorResponder: Send + Sync {
-    /// Emits a complete HTTP/1.x response for a proxy error.
+    /// Generates an HTTP response for the given error status code.
     fn error_response<'a>(
         &'a self,
         status: StatusCode,
@@ -110,14 +128,30 @@ impl ErrorResponder for DefaultResponseWriter {
 }
 
 #[dynosaur(DynRequestHandler = dyn(box) RequestHandler)]
+/// Routes HTTP requests to upstream iroh endpoints.
+///
+/// Implement this trait to control how requests are routed. The handler
+/// receives the client address and request, and may modify the request
+/// (e.g., adding headers) before returning the destination endpoint.
 pub trait RequestHandler: Send + Sync {
+    /// Determines the upstream endpoint for this request.
+    ///
+    /// May modify `req` to add proxy headers or transform the request.
+    /// Return [`Deny`] to reject the request with an error response.
     fn handle_request(
         &self,
-        _src_addr: SocketAddr,
-        _req: &mut HttpRequest,
+        src_addr: SocketAddr,
+        req: &mut HttpRequest,
     ) -> impl Future<Output = Result<EndpointId, Deny>> + Send;
 }
 
+/// Forward proxy handler that routes all requests to a fixed endpoint.
+///
+/// Validates that requests use proper forward-proxy form:
+/// - CONNECT requests must use authority-form (`host:port`)
+/// - Other requests must use absolute-form (`http://host/path`)
+///
+/// Adds `X-Forwarded-For` and `Via` headers to forwarded requests.
 pub struct StaticForwardProxy(pub EndpointId);
 
 impl RequestHandler for StaticForwardProxy {
@@ -145,6 +179,14 @@ impl RequestHandler for StaticForwardProxy {
     }
 }
 
+/// Reverse proxy handler that routes all requests to a fixed backend.
+///
+/// Validates that requests use origin-form (`/path`) and rejects:
+/// - CONNECT requests (not supported in reverse proxy mode)
+/// - Absolute-form requests in HTTP/1.x (forward proxy requests)
+///
+/// Transforms requests to absolute-form for forwarding to the upstream proxy,
+/// and adds `X-Forwarded-For` and `Via` headers.
 pub struct StaticReverseProxy(pub EndpointAuthority);
 
 impl RequestHandler for StaticReverseProxy {
@@ -173,10 +215,23 @@ impl RequestHandler for StaticReverseProxy {
     }
 }
 
+/// Chains multiple request handlers, trying each in order.
+///
+/// Returns the first successful result, or the last error if all handlers fail.
+/// Useful for supporting both forward and reverse proxy modes simultaneously.
+///
+/// # Example
+///
+/// ```ignore
+/// let handler = RequestHandlerChain::default()
+///     .push(StaticForwardProxy(upstream_id))
+///     .push(StaticReverseProxy(destination));
+/// ```
 #[derive(Default)]
 pub struct RequestHandlerChain(Vec<Box<DynRequestHandler<'static>>>);
 
 impl RequestHandlerChain {
+    /// Appends a handler to the chain.
     pub fn push(mut self, handler: impl RequestHandler + 'static) -> Self {
         self.0.push(DynRequestHandler::new_box(handler));
         self
@@ -202,8 +257,14 @@ impl RequestHandler for RequestHandlerChain {
     }
 }
 
+/// Request rejection with HTTP status code and reason.
+///
+/// Returned by [`RequestHandler`] to reject a request. The proxy will
+/// send an error response to the client with the specified status code.
 pub struct Deny {
+    /// Human-readable explanation (for logging, not sent to client).
     pub reason: AnyError,
+    /// HTTP status code to return to the client.
     pub code: StatusCode,
 }
 
@@ -214,10 +275,12 @@ impl From<AnyError> for Deny {
 }
 
 impl Deny {
+    /// Creates a 400 Bad Request denial.
     pub fn bad_request(reason: impl Into<AnyError>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, reason)
     }
 
+    /// Creates a denial with the specified status code and reason.
     pub fn new(code: StatusCode, reason: impl Into<AnyError>) -> Self {
         Self {
             code,

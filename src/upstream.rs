@@ -29,11 +29,33 @@ pub use auth::*;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The `UpstreamProxy` accepts iroh streams and forwards them to upstream TCP destinations.
+/// Proxy that receives iroh streams and forwards them to origin servers.
 ///
-/// It implements [`ProtocolHandler`] and is intended to be mounted onto a [`Router`].
+/// The upstream proxy is the server-side component that accepts connections from
+/// downstream proxies over iroh and forwards requests to actual TCP origin servers.
 ///
-/// [`Router`]: iroh::protocol::Router
+/// # Protocol Support
+///
+/// - **CONNECT tunnels**: Establishes TCP connections to the requested authority
+///   and bidirectionally forwards data.
+/// - **Absolute-form requests**: Forwards HTTP requests to origin servers using
+///   reqwest, with hop-by-hop header filtering per RFC 9110.
+///
+/// # Authorization
+///
+/// All requests pass through an [`AuthHandler`] before processing. Unauthorized
+/// requests receive a 403 Forbidden response.
+///
+/// # Usage
+///
+/// Implements [`ProtocolHandler`] for use with iroh's [`Router`](iroh::protocol::Router):
+///
+/// ```ignore
+/// let proxy = UpstreamProxy::new(AcceptAll)?;
+/// let router = Router::builder(endpoint)
+///     .accept(ALPN, proxy)
+///     .spawn();
+/// ```
 #[derive(derive_more::Debug)]
 pub struct UpstreamProxy {
     #[debug("Arc<dyn AuthHandler>")]

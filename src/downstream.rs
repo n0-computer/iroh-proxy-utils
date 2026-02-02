@@ -35,7 +35,22 @@ use crate::{
 
 pub(crate) mod opts;
 
-/// Accepts TCP streams and forwards them to upstream iroh destinations.
+/// Proxy that accepts TCP connections and forwards them over iroh.
+///
+/// The downstream proxy is the client-facing component that receives incoming
+/// TCP connections (typically HTTP requests) and routes them to upstream proxies
+/// via iroh's peer-to-peer QUIC connections.
+///
+/// # Modes
+///
+/// - **TCP mode**: Blindly tunnels all traffic to a fixed upstream destination.
+/// - **HTTP mode**: Parses HTTP requests to enable dynamic routing and supports
+///   both forward proxy (absolute-form) and reverse proxy (origin-form) requests.
+///
+/// # Connection Pooling
+///
+/// Maintains a pool of iroh connections to upstream endpoints for efficiency.
+/// Multiple requests to the same endpoint share a single QUIC connection.
 #[derive(Clone, Debug)]
 pub struct DownstreamProxy {
     pool: ConnectionPool,
@@ -233,27 +248,34 @@ impl DownstreamProxy {
     }
 }
 
-/// Bidirectional streams for a single iroh tunnel.
+/// Bidirectional QUIC streams for an established tunnel.
+///
+/// Returned by [`DownstreamProxy::create_tunnel`] after a successful CONNECT
+/// handshake with the upstream proxy. Use these streams for bidirectional
+/// data transfer through the tunnel.
 pub struct TunnelClientStreams {
-    /// QUIC send stream toward the upstream proxy.
+    /// Send stream toward the upstream proxy.
     pub send: SendStream,
-    /// QUIC recv stream from the upstream proxy.
+    /// Receive stream from the upstream proxy (with read-ahead buffer).
     pub recv: Prebuffered<RecvStream>,
-    /// Connection handle kept alive for the tunnel lifetime.
+    /// Connection reference that keeps the QUIC connection alive.
     pub conn: ConnectionRef,
 }
 
+/// Routing destination combining an iroh endpoint and target authority.
+///
+/// Specifies both the upstream proxy to connect to (via `endpoint_id`) and
+/// the origin server to reach through that proxy (via `authority`).
 #[derive(Debug, Clone)]
-/// Endpoint identifier paired with the target authority.
 pub struct EndpointAuthority {
-    /// Destination iroh endpoint identifier.
+    /// Iroh endpoint identifier of the upstream proxy.
     pub endpoint_id: EndpointId,
-    /// Target authority for the CONNECT request.
+    /// Target authority for the CONNECT request (host:port).
     pub authority: Authority,
 }
 
 impl EndpointAuthority {
-    /// Constructs an `EndpointAuthority` from its components.
+    /// Creates a new endpoint-authority pair.
     pub fn new(endpoint_id: EndpointId, authority: Authority) -> Self {
         Self {
             endpoint_id,
@@ -261,12 +283,13 @@ impl EndpointAuthority {
         }
     }
 
+    /// Returns a short string representation for logging.
     pub fn fmt_short(&self) -> String {
         format!("{}->{}", self.endpoint_id.fmt_short(), self.authority)
     }
 }
 
-/// Error type for downstream proxy failures.
+/// Error from downstream proxy operations.
 #[stack_error(add_meta, derive)]
 pub struct ProxyError {
     response_status: Option<StatusCode>,

@@ -6,23 +6,32 @@ use n0_error::StackError;
 
 use crate::parse::HttpProxyRequest;
 
-/// Authorization errors for proxy requests.
+/// Authorization failure reasons.
+///
+/// Returned by [`AuthHandler::authorize`] to indicate why a request was rejected.
+/// The upstream proxy responds with 403 Forbidden for all variants.
 #[derive(StackError)]
 pub enum AuthError {
-    /// Credentials are malformed or fail validation.
+    /// Credentials are malformed or failed validation.
     InvalidCredentials,
-    /// Credentials are valid but expired.
+    /// Credentials were valid but have expired.
     TokenExpired,
-    /// Authorization failed for this request.
+    /// Authorization denied for this request.
     Forbidden,
-    /// Request is invalid for the selected authentication scheme.
+    /// Request is invalid for the authentication scheme.
     BadRequest,
 }
 
 #[dynosaur(pub(crate) DynAuthHandler = dyn(box) AuthHandler)]
-/// Authorizes a proxy request from a remote endpoint.
+/// Authorizes proxy requests from remote endpoints.
+///
+/// Implement this trait to control which requests are allowed through the
+/// upstream proxy. Authorization decisions can be based on the remote endpoint
+/// identity, request target, headers, or any other criteria.
 pub trait AuthHandler: Send + Sync {
-    /// Checks authorization for the given remote endpoint and request.
+    /// Checks if the request from `remote_id` should be authorized.
+    ///
+    /// Returns `Ok(())` to allow the request, or an [`AuthError`] to reject it.
     fn authorize<'a>(
         &'a self,
         remote_id: EndpointId,
@@ -30,8 +39,8 @@ pub trait AuthHandler: Send + Sync {
     ) -> impl Future<Output = Result<(), AuthError>> + Send + 'a;
 }
 
-/// Authorization handler that rejects all requests.
-#[derive(Debug)]
+/// Authorization handler that rejects all requests with 403 Forbidden.
+#[derive(Debug, Default)]
 pub struct DenyAll;
 
 impl AuthHandler for DenyAll {
@@ -44,8 +53,10 @@ impl AuthHandler for DenyAll {
     }
 }
 
-/// Authorization handler that accepts all requests.
-#[derive(Debug)]
+/// Authorization handler that accepts all requests unconditionally.
+///
+/// Suitable for testing or when authorization is handled elsewhere.
+#[derive(Debug, Default)]
 pub struct AcceptAll;
 
 impl AuthHandler for AcceptAll {
