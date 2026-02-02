@@ -73,6 +73,10 @@ impl FromStr for Authority {
 }
 
 impl Authority {
+    pub fn new(host: String, port: u16) -> Self {
+        Self { host, port }
+    }
+
     /// Parses an authority-form URI with no scheme and no path.
     ///
     /// Note: the URI must include a port.
@@ -256,6 +260,30 @@ impl HttpRequest {
             .and_then(|x| x.to_str().ok())
     }
 
+    /// Classify into a kind based on the request kind.
+    ///
+    /// Returns an error for invalid combinations:
+    /// - CONNECT request without authority-form target
+    pub fn classify(&self) -> Result<HttpRequestKind> {
+        match self.method {
+            Method::CONNECT => {
+                if self.uri.scheme().is_some()
+                    || self.uri.path_and_query().is_some()
+                    || self.uri.authority().is_none()
+                    || self.uri.authority().and_then(|a| a.port_u16()).is_none()
+                {
+                    Err(anyerr!("Invalid request-target form for CONNECT request"))
+                } else {
+                    Ok(HttpRequestKind::Tunnel)
+                }
+            }
+            _ => match self.uri.scheme() {
+                None => Ok(HttpRequestKind::Origin),
+                Some(_) => Ok(HttpRequestKind::Absolute),
+            },
+        }
+    }
+
     pub fn set_forwarded_for(&mut self, src_addr: SocketAddr) -> &mut Self {
         self.headers.append(
             X_FORWARDED_FOR,
@@ -287,7 +315,7 @@ impl HttpRequest {
         Ok(self)
     }
 
-    pub fn set_http_authority(&mut self, authority: Authority) -> Result<&mut Self> {
+    pub fn set_absolute_http_authority(&mut self, authority: Authority) -> Result<&mut Self> {
         let mut parts = self.uri.clone().into_parts();
         parts.authority = Some(authority.to_string().parse().anyerr()?);
         parts.scheme = Some(Scheme::HTTP);
@@ -330,6 +358,13 @@ impl HttpRequest {
         writer.write_all(b"\r\n").await?;
         Ok(())
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum HttpRequestKind {
+    Tunnel,
+    Absolute,
+    Origin,
 }
 
 /// Proxy request targets per RFC 9110.

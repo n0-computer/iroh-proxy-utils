@@ -167,7 +167,7 @@ impl RequestHandler for StaticReverseProxy {
         }
         req.set_forwarded_for(src_addr)
             .set_via("iroh-proxy")?
-            .set_http_authority(self.0.authority.clone())
+            .set_absolute_http_authority(self.0.authority.clone())
             .map_err(|err| Deny::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
         Ok(self.0.endpoint_id)
     }
@@ -205,6 +205,12 @@ impl RequestHandler for RequestHandlerChain {
 pub struct Deny {
     pub reason: AnyError,
     pub code: StatusCode,
+}
+
+impl From<AnyError> for Deny {
+    fn from(value: AnyError) -> Self {
+        Self::bad_request(value)
+    }
 }
 
 impl Deny {

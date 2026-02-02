@@ -217,7 +217,7 @@ impl RequestHandler for SubdomainRouter {
             .get(subdomain)
             .cloned()
             .ok_or_else(|| Deny::new(StatusCode::NOT_FOUND, "unknown subdomain"))?;
-        req.set_http_authority(destination.authority)
+        req.set_absolute_http_authority(destination.authority)
             .map_err(|err| Deny::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
         Ok(destination.endpoint_id)
     }

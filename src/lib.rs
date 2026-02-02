@@ -7,7 +7,9 @@ mod parse;
 pub mod upstream;
 mod util;
 
-pub use parse::{Authority, HttpProxyRequest, HttpProxyRequestKind, HttpRequest, HttpResponse};
+pub use parse::{
+    Authority, HttpProxyRequest, HttpProxyRequestKind, HttpRequest, HttpRequestKind, HttpResponse,
+};
 
 /// How much data to read for the CONNECT handshake before it's considered invalid.
 pub(crate) const HEADER_SECTION_MAX_LENGTH: usize = 8192;
