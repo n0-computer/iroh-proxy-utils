@@ -28,7 +28,8 @@ pub use self::opts::{
     ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
 };
 use crate::{
-    ALPN, Authority, HEADER_SECTION_MAX_LENGTH, HttpProxyRequest,
+    ALPN, Authority, HEADER_SECTION_MAX_LENGTH, HttpOriginRequest, HttpProxyRequest,
+    HttpProxyRequestKind,
     parse::{HttpRequest, HttpResponse},
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
@@ -130,10 +131,13 @@ impl DownstreamProxy {
                     async move { Ok::<_, Infallible>(this.handle_hyper_request(req, opts).await) }
                 });
                 // Enable upgrades for HTTP/1.1 CONNECT support
-                if let Err(err) = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(io, service)
-                    .await
-                {
+                let mut builder = auto::Builder::new(TokioExecutor::new());
+                builder
+                    .http2()
+                    .initial_stream_window_size(1 << 20)
+                    .initial_connection_window_size(1 << 20)
+                    .max_concurrent_streams(1024);
+                if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
                     debug!(?err, "http connection closed with error");
                 }
             }
@@ -293,7 +297,46 @@ impl DownstreamProxy {
         };
 
         let (parts, body) = req.into_parts();
+        let version = parts.version;
         let request = HttpRequest::from_http_parts(parts).map_err(ProxyError::bad_request)?;
+
+        // In HTTP/2, the :scheme pseudo-header is always present, so all non-CONNECT requests
+        // are classified as absolute-form (forward proxy). When reverse mode is configured,
+        // reclassify absolute-form requests as origin-form for reverse proxy routing.
+        // CONNECT (tunnel) requests are never reclassified.
+        let request = if version == http::Version::HTTP_2 {
+            match request {
+                HttpRequest::Forward(HttpProxyRequest {
+                    kind: HttpProxyRequestKind::Absolute { target, method },
+                    mut headers,
+                }) if opts.as_reverse().is_ok() => {
+                    let uri: http::Uri = target
+                        .parse()
+                        .map_err(|e: http::uri::InvalidUri| ProxyError::bad_request(anyerr!(e)))?;
+                    let path = uri
+                        .path_and_query()
+                        .map(|pq| pq.to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    // Ensure host header is set from URI authority for reverse proxy resolvers.
+                    if !headers.contains_key(http::header::HOST) {
+                        if let Some(authority) = uri.authority() {
+                            if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
+                                headers.insert(http::header::HOST, value);
+                            }
+                        }
+                    }
+                    HttpRequest::Origin(HttpOriginRequest {
+                        path,
+                        method,
+                        headers,
+                    })
+                }
+                other => other,
+            }
+        } else {
+            request
+        };
+
         match request {
             HttpRequest::Forward(forward_request) => {
                 let forward = opts.as_forward()?;

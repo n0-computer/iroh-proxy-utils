@@ -970,6 +970,67 @@ async fn h2_multiple_connect_requests_single_connection() -> Result<()> {
     Ok(())
 }
 
+/// HTTP/2 reverse proxy using reqwest with h2 prior knowledge.
+#[tokio::test]
+#[traced_test]
+async fn h2_reqwest_reverse() -> Result<()> {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .anyerr()?;
+    let res = client
+        .get(format!("http://{proxy_addr}/reverse/path"))
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, "origin GET /reverse/path");
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// HTTP/2 forward proxy (absolute-form) using reqwest with h2 prior knowledge.
+#[tokio::test]
+#[traced_test]
+async fn h2_reqwest_forward() -> Result<()> {
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
+
+    let mode =
+        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+        .build()
+        .anyerr()?;
+    let res = client
+        .get(format!("http://{origin_addr}/test/path"))
+        .send()
+        .await
+        .anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = res.text().await.anyerr()?;
+    assert_eq!(text, "origin GET /test/path");
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
 mod origin_server {
     use std::{convert::Infallible, sync::Arc};
 
