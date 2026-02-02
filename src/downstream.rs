@@ -92,9 +92,12 @@ impl DownstreamProxy {
                     .child_token()
                     .run_until_cancelled_owned(async move {
                         debug!(%client_addr, "accepted TCP connection");
-                        this.forward_tcp_stream(client_addr, client_stream, &mode)
+                        if let Err(err) = this
+                            .forward_tcp_stream(client_addr, client_stream, &mode)
                             .await
-                            .ok();
+                        {
+                            warn!("Failed to handle TCP connection: {err:#}");
+                        }
                     })
                     .instrument(error_span!("tcp-accept", id)),
             );
@@ -111,64 +114,47 @@ impl DownstreamProxy {
     async fn forward_tcp_stream(
         &self,
         src_addr: SocketAddr,
-        tcp_stream: TcpStream,
+        mut tcp_stream: TcpStream,
         mode: &ProxyMode,
     ) -> Result<()> {
         match mode {
             ProxyMode::Tcp(destination) => {
-                if let Err(err) = self
-                    .forward_tcp_stream_to_tunnel(tcp_stream, destination)
+                let (mut tcp_recv, mut tcp_send) = tcp_stream.split();
+                let mut conn = self.create_tunnel(destination).await?;
+                debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
+                forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
                     .await
-                {
-                    warn!("Error while forwarding TCP stream: {err:#}");
-                }
+                    .map_err(ProxyError::io)?;
+                Ok(())
             }
             ProxyMode::Http(opts) => {
-                let this = self.clone();
                 let io = TokioIo::new(tcp_stream);
-                let service = service_fn(move |req| {
-                    let this = this.clone();
+                let service = service_fn(|req| {
+                    let this = self.clone();
                     let opts = opts.clone();
                     async move {
-                        match this.handle_hyper_request(src_addr, req, &opts).await {
-                            Ok(res) => Ok::<_, Infallible>(res),
+                        let res = match this.handle_hyper_request(src_addr, req, &opts).await {
+                            Ok(res) => res,
                             Err(err) => {
                                 warn!("Error while forwarding HTTP/2 request: {err:#}");
                                 let status =
                                     err.response_status().unwrap_or(StatusCode::BAD_GATEWAY);
-                                let res = opts.error_response(status).await;
-                                Ok(res)
+                                opts.error_response(status).await
                             }
-                        }
+                        };
+                        Ok::<_, Infallible>(res)
                     }
                 });
-                // Enable upgrades for HTTP/1.1 CONNECT support
                 let mut builder = auto::Builder::new(TokioExecutor::new());
                 builder
                     .http2()
                     .initial_stream_window_size(1 << 20)
                     .initial_connection_window_size(1 << 20)
                     .max_concurrent_streams(1024);
-                if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
-                    debug!(?err, "http connection closed with error");
-                }
+                builder.serve_connection_with_upgrades(io, service).await?;
+                Ok(())
             }
         }
-        Ok(())
-    }
-
-    pub async fn forward_tcp_stream_to_tunnel(
-        &self,
-        mut tcp_stream: TcpStream,
-        destination: &EndpointAuthority,
-    ) -> Result<(), ProxyError> {
-        let (mut tcp_recv, mut tcp_send) = tcp_stream.split();
-        let mut conn = self.create_tunnel(destination).await?;
-        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
-        forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
-            .await
-            .map_err(ProxyError::io)?;
-        Ok(())
     }
 
     async fn connect(&self, destination: EndpointId) -> Result<TunnelClientStreams, ProxyError> {
@@ -419,8 +405,6 @@ fn recv_to_stream_body(
 }
 
 fn h2_error_response(status: StatusCode) -> Response<HyperBody> {
-    // let reason = status.canonical_reason().unwrap_or("");
-    // let content = format!("{} {}", status.as_u16(), reason);
     let body = Empty::new().map_err(infallible_to_io);
     let mut res = Response::builder().status(status);
     res.headers_mut().unwrap().insert(
@@ -428,9 +412,6 @@ fn h2_error_response(status: StatusCode) -> Response<HyperBody> {
         HeaderValue::from_str("0").unwrap(),
     );
     res.body(body.boxed()).unwrap()
-    // .unwrap_or_else(|_| {
-    //     Response::new(Full::new(Bytes::new()).map_err(infallible_to_io).boxed())
-    // })
 }
 
 async fn forward_hyper_body(mut body: Incoming, send: &mut SendStream) -> Result<(), ProxyError> {
