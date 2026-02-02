@@ -2,7 +2,7 @@ use std::{net::SocketAddr, str::FromStr};
 
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version,
-    header::{self, InvalidHeaderValue},
+    header::{self, AsHeaderName, InvalidHeaderValue},
     uri::{Scheme, Uri},
 };
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
@@ -199,7 +199,6 @@ impl HttpRequest {
     pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
-            tracing::debug!(l=reader.buffer().len(), s=%String::from_utf8_lossy(reader.buffer()), "HttpRequest::peek");
             if let Some(request) = Self::parse_with_len(reader.buffer())? {
                 return Ok(request);
             }
@@ -294,6 +293,16 @@ impl HttpRequest {
             X_FORWARDED_FOR,
             HeaderValue::from_str(&src_addr.to_string()).expect("valid header value"),
         );
+        self
+    }
+
+    pub fn remove_headers(
+        &mut self,
+        names: impl IntoIterator<Item = impl AsHeaderName>,
+    ) -> &mut Self {
+        for header in names {
+            self.headers.remove(header);
+        }
         self
     }
 
@@ -509,11 +518,6 @@ impl HttpResponse {
     pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
-            tracing::info!(
-                len = reader.buffer().len(),
-                b = %String::from_utf8_lossy(reader.buffer()),
-                "Response::peek"
-            );
             if let Some(response) = Self::parse_with_len(reader.buffer())? {
                 return Ok(response);
             }

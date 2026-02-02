@@ -134,7 +134,7 @@ impl UpstreamProxy {
         let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
         let req = HttpRequest::read(&mut recv).await?;
 
-        debug!(?req, "incoming request");
+        debug!(?req, "handle request");
         let req = req
             .try_into_proxy_request()
             .context("Received origin-form request but expected proxy request")?;
@@ -155,6 +155,7 @@ impl UpstreamProxy {
 
         match req.kind {
             HttpProxyRequestKind::Tunnel { target: authority } => {
+                debug!(%authority, "tunnel request: connecting to origin");
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to origin server: {err:#}");
@@ -176,13 +177,16 @@ impl UpstreamProxy {
                             .await
                             .context("Failed to write CONNECT response to downstream")?;
                         let (mut origin_recv, mut origin_send) = tcp_stream.into_split();
-                        forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send)
-                            .await?;
+                        let (to_origin, from_origin) =
+                            forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send)
+                                .await?;
+                        debug!(to_origin, from_origin, "finish");
                         Ok(())
                     }
                 }
             }
             HttpProxyRequestKind::Absolute { method, target } => {
+                debug!(%target, "origin request: connecting to origin");
                 let body = recv_stream_to_body(recv);
 
                 // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
@@ -190,21 +194,25 @@ impl UpstreamProxy {
                 filter_hop_by_hop_headers(&mut headers);
 
                 // Forward the request to the upstream server.
-                let mut res = http_client
+                let mut response = http_client
                     .request(method, target)
                     .headers(headers)
                     .body(body)
                     .send()
                     .await
                     .anyerr()?;
-                filter_hop_by_hop_headers(res.headers_mut());
-                write_response_header(&res, &mut send).await?;
-                let mut body = res.bytes_stream();
+                filter_hop_by_hop_headers(response.headers_mut());
+                debug!(?response, "received response from origin");
+                write_response_header(&response, &mut send).await?;
+                let mut total = 0;
+                let mut body = response.bytes_stream();
                 while let Some(bytes) = body.next().await {
                     let bytes = bytes.anyerr()?;
+                    total += bytes.len();
                     send.write_chunk(bytes).await.anyerr()?;
                 }
                 send.finish().anyerr()?;
+                debug!(response_body_len=%total, "finish");
                 Ok(())
             }
         }

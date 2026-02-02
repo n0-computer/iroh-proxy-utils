@@ -1,7 +1,7 @@
 use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr};
 
 use bytes::Bytes;
-use http::{HeaderValue, Method, StatusCode};
+use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
 use hyper::{
     Request, Response,
@@ -21,7 +21,7 @@ use n0_error::{AnyError, Result, StdResultExt, anyerr, stack_error};
 use n0_future::TryStreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error_span, info, warn};
+use tracing::{Instrument, debug, error_span, warn};
 
 pub use self::opts::{
     Deny, ErrorResponder, HttpProxyOpts, PoolOpts, ProxyMode, RequestHandler, RequestHandlerChain,
@@ -174,104 +174,63 @@ impl DownstreamProxy {
     async fn handle_hyper_request(
         &self,
         src_addr: SocketAddr,
-        mut req: Request<Incoming>,
+        mut request: Request<Incoming>,
         opts: &HttpProxyOpts,
     ) -> Result<Response<HyperBody>, ProxyError> {
-        debug!("handling request: {req:?}");
+        debug!(?request, "incoming");
 
-        if req.method() == Method::CONNECT {
-            let upgrade = if req.version() < http::Version::HTTP_2 {
-                Some(hyper::upgrade::on(&mut req))
+        let is_connect = request.method() == Method::CONNECT;
+
+        // Handle upgrade for CONNECT requests over HTTP/1.
+        let upgrade = if is_connect && request.version() < http::Version::HTTP_2 {
+            Some(hyper::upgrade::on(&mut request))
+        } else {
+            None
+        };
+
+        let (parts, body) = request.into_parts();
+        let mut request = HttpRequest::from_parts(parts);
+
+        let destination = opts
+            .request_handler
+            .handle_request(src_addr, &mut request)
+            .await?;
+
+        debug!(destination=%destination.fmt_short(), ?request, "pipe request to upstream");
+
+        // Connect to upstream.
+        let mut conn = self.connect(destination).await?;
+
+        debug!("connected to upstream");
+
+        // Forward the request header section.
+        request.write(&mut conn.send).await?;
+
+        let (response, body) = if is_connect {
+            // For CONNECT requests, we first read the upstream response, and afterwards pipe the body.
+            let response = read_response(&mut conn.recv).await?;
+            debug!(?response, "pipe response to client");
+
+            if !response.status.is_success() {
+                (response, None)
+            } else if let Some(upgrade_fut) = upgrade {
+                spawn(forward_hyper_upgrade(upgrade_fut, conn));
+                (response, None)
             } else {
-                None
-            };
-
-            let (parts, body) = req.into_parts();
-            let mut request = HttpRequest::from_parts(parts);
-
-            let destination = opts
-                .request_handler
-                .handle_request(src_addr, &mut request)
-                .await?;
-            debug!("destination: {destination}");
-            // Connect to upstream and send the CONNECT request
-            let mut conn = self.connect(destination).await?;
-            request.write(&mut conn.send).await?;
-            // Read the response from upstream
-            let response = HttpResponse::read(&mut conn.recv)
-                .await
-                .map_err(ProxyError::bad_gateway)?;
-            debug!(?response, "upstream CONNECT response");
-
-            if response.status != StatusCode::OK {
-                // Forward the error response from upstream
-                return Ok(h2_error_response(response.status));
-            }
-
-            // For HTTP/1.1, use the upgrade mechanism
-            // For HTTP/2, use the body streams
-            if let Some(upgrade_fut) = upgrade {
-                // HTTP/1.1 path: after returning 200 OK, the connection is upgraded
-                // Spawn a task that waits for the upgrade and then handles bidirectional copy
-                tokio::spawn(async move {
-                    if let Err(err) = forward_hyper_upgrade(upgrade_fut, &mut conn).await {
-                        warn!("CONNECT upgrade failed: {err:#}");
-                    }
-                });
-
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Empty::new().map_err(infallible_to_io).boxed())
-                    .unwrap())
-            } else {
-                // HTTP/2 path: request body and response body are the bidirectional tunnel
-                tokio::spawn(async move {
-                    if let Err(err) = forward_hyper_body(body, &mut conn.send).await {
-                        debug!("CONNECT client->upstream pipe ended: {err:#}");
-                    }
-                });
-                forward_upstream_response_to_hyper(response, conn.recv)
+                spawn(forward_hyper_body(body, conn.send));
+                (response, Some(conn.recv))
             }
         } else {
-            let (parts, body) = req.into_parts();
-            let mut request = HttpRequest::from_parts(parts);
-            let destination = opts
-                .request_handler
-                .handle_request(src_addr, &mut request)
-                .await?;
-            debug!("destination: {destination}");
-            let mut conn = self.connect(destination).await?;
-            request.write(&mut conn.send).await?;
-            tokio::spawn(async move {
-                if let Err(err) = forward_hyper_body(body, &mut conn.send).await {
-                    warn!("failed to forward request body to upstream: {err:#}");
-                }
-            });
-            let response = HttpResponse::read(&mut conn.recv)
-                .await
-                .map_err(ProxyError::bad_gateway)?;
-            info!(?response, "downstream read response");
-            forward_upstream_response_to_hyper(response, conn.recv)
-        }
-    }
-}
+            // For non-CONNECT requests, we pipe the body and read the response concurrently.
+            spawn(forward_hyper_body(body, conn.send));
+            // Read the response from upstream.
+            let response = read_response(&mut conn.recv).await?;
+            (response, Some(conn.recv))
+        };
 
-async fn forward_hyper_upgrade(
-    upgrade_fut: hyper::upgrade::OnUpgrade,
-    conn: &mut TunnelClientStreams,
-) -> Result<()> {
-    let upgraded = upgrade_fut.await.std_context("HTTP/1 upgrade failed")?;
-    let upgraded = TokioIo::new(upgraded);
-    // Split the upgraded connection for bidirectional copy
-    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
-    forward_bidi(
-        &mut client_read,
-        &mut client_write,
-        &mut conn.recv,
-        &mut conn.send,
-    )
-    .await?;
-    Ok(())
+        debug!(?response, "pipe response to client");
+        response_to_hyper(response, body)
+    }
 }
 
 /// Bidirectional streams for a single iroh tunnel.
@@ -355,43 +314,72 @@ impl ProxyError {
 
 type HyperBody = BoxBody<Bytes, io::Error>;
 
-fn forward_upstream_response_to_hyper(
+fn response_to_hyper(
     response: HttpResponse,
-    recv: Prebuffered<RecvStream>,
+    body: Option<Prebuffered<RecvStream>>,
 ) -> Result<Response<HyperBody>, ProxyError> {
     let mut builder = Response::builder().status(response.status);
     let headers = builder.headers_mut().unwrap();
     *headers = response.headers;
-    let body = StreamBody::new(recv_to_stream(recv).map_ok(Frame::data)).boxed();
+    let body = match body {
+        Some(body) => StreamBody::new(recv_to_stream(body).map_ok(Frame::data)).boxed(),
+        None => Empty::new().map_err(infallible_to_io).boxed(),
+    };
     builder
         .body(body)
         .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
 }
 
-fn h2_error_response(status: StatusCode) -> Response<HyperBody> {
-    let body = Empty::new().map_err(infallible_to_io);
-    let mut res = Response::builder().status(status);
-    res.headers_mut().unwrap().insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str("0").unwrap(),
-    );
-    res.body(body.boxed()).unwrap()
-}
-
-async fn forward_hyper_body(mut body: Incoming, send: &mut SendStream) -> Result<(), ProxyError> {
+async fn forward_hyper_body(mut body: Incoming, mut send: SendStream) -> Result<()> {
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|err| ProxyError::io(anyerr!(err)))?;
+        let frame = frame.anyerr()?;
         // TODO: Add support for trailers.
         if let Ok(data) = frame.into_data() {
-            send.write_all(&data).await?;
+            send.write_all(&data).await.anyerr()?;
         }
     }
-    send.finish()
-        .map_err(io::Error::from)
-        .map_err(ProxyError::io)?;
+    send.finish().anyerr()?;
     Ok(())
+}
+
+async fn forward_hyper_upgrade(
+    upgrade_fut: hyper::upgrade::OnUpgrade,
+    mut conn: TunnelClientStreams,
+) -> Result<()> {
+    let upgraded = upgrade_fut.await.std_context("HTTP/1 upgrade failed")?;
+    let upgraded = TokioIo::new(upgraded);
+    // Split the upgraded connection for bidirectional copy
+    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+    forward_bidi(
+        &mut client_read,
+        &mut client_write,
+        &mut conn.recv,
+        &mut conn.send,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn read_response(recv: &mut Prebuffered<RecvStream>) -> Result<HttpResponse, ProxyError> {
+    HttpResponse::read(recv)
+        .await
+        .map_err(ProxyError::bad_gateway)
 }
 
 fn infallible_to_io(err: Infallible) -> io::Error {
     match err {}
+}
+
+fn spawn<F, T>(fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    tokio::spawn(
+        async move {
+            if let Err(err) = fut.await {
+                warn!("{err:#}")
+            }
+        }
+        .instrument(tracing::Span::current()),
+    )
 }
