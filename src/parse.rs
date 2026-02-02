@@ -21,8 +21,8 @@ const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
     header::UPGRADE,
 ];
 
-/// Headers listed in the Connection header should also be removed.
-const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const X_FORWARDED_FOR: &str = "x-forwarded-for";
+const X_FORWARDED_HOST: &str = "x-forwarded-host";
 
 /// Removes hop-by-hop headers from a HeaderMap per RFC 9110 Section 7.6.1.
 ///
@@ -45,9 +45,6 @@ pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
-
-    // Remove Keep-Alive (not in http crate's header constants)
-    headers.remove(&KEEP_ALIVE);
 
     // Remove any headers that were listed in the Connection header
     for name in connection_headers {
@@ -167,9 +164,6 @@ pub struct HttpRequest {
     pub method: Method,
 }
 
-const X_FORWARDED_FOR: &str = "x-forwarded-for";
-const X_FORWARDED_HOST: &str = "x-forwarded-host";
-
 impl HttpRequest {
     /// Creates a request from hyper request parts.
     pub fn from_parts(parts: http::request::Parts) -> Self {
@@ -197,7 +191,7 @@ impl HttpRequest {
     }
 
     /// Converts from an `httparse::Request` after successful parsing.
-    pub fn from_parsed_request(req: httparse::Request) -> Result<Self> {
+    fn from_parsed_request(req: httparse::Request) -> Result<Self> {
         let method_str = req.method.context("Missing HTTP method")?;
         let method = method_str.parse().std_context("Invalid HTTP method")?;
         let path = req.path.context("Missing request target")?;
@@ -304,25 +298,31 @@ impl HttpRequest {
     ///
     /// # Errors
     ///
-    /// Returns an error if a CONNECT request lacks a valid authority-form target.
+    /// Returns an error if a CONNECT request lacks a valid authority-form target,
+    /// or if an HTTP/1 absolute-form request target includes a scheme but no authority.
     pub fn classify(&self) -> Result<HttpRequestKind> {
+        let uri = &self.uri;
         match self.method {
             Method::CONNECT => {
-                if self.uri.scheme().is_some()
-                    || self.uri.path_and_query().is_some()
-                    || self.uri.authority().is_none()
-                    || self.uri.authority().and_then(|a| a.port_u16()).is_none()
-                {
-                    Err(anyerr!("Invalid request-target form for CONNECT request"))
-                } else {
-                    Ok(HttpRequestKind::Tunnel)
-                }
+                ensure_any!(
+                    uri.scheme().is_none()
+                        && uri.path_and_query().is_none()
+                        && uri.authority().is_some()
+                        && uri.authority().and_then(|a| a.port_u16()).is_some(),
+                    "Invalid request-target form for CONNECT request"
+                );
+
+                Ok(HttpRequestKind::Tunnel)
             }
             _ => {
                 // Absolute-form requests are only support for HTTP/1. In HTTP/2, absolute-form and origin-form
                 // requests are indistinguishable, so we always report origin-form.
                 if self.uri.scheme().is_some() && self.version < Version::HTTP_2 {
-                    Ok(HttpRequestKind::Absolute)
+                    ensure_any!(
+                        self.uri.authority().is_some(),
+                        "Invalid request target: scheme without authority"
+                    );
+                    Ok(HttpRequestKind::Http1Absolute)
                 } else {
                     Ok(HttpRequestKind::Origin)
                 }
@@ -437,7 +437,9 @@ pub enum HttpRequestKind {
     /// CONNECT method with authority-form target (`host:port`).
     Tunnel,
     /// Request with absolute-form target (`http://host/path`).
-    Absolute,
+    ///
+    /// Only available in HTTP/1, because in HTTP/2 origin-form request usually have the authority set as well.
+    Http1Absolute,
     /// Request with origin-form target (`/path`).
     Origin,
 }
