@@ -1,15 +1,18 @@
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 use iroh::{Endpoint, EndpointId, protocol::Router};
-use iroh_proxy_utils::HttpRequest;
-use iroh_proxy_utils::downstream::{Deny, RequestHandler, StaticForwardProxy, StaticReverseProxy};
 use iroh_proxy_utils::{
-    ALPN, Authority, IROH_DESTINATION_HEADER,
-    downstream::{DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode},
+    ALPN, Authority, HttpRequest, IROH_DESTINATION_HEADER,
+    downstream::{
+        Deny, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode, RequestHandler,
+        StaticForwardProxy, StaticReverseProxy,
+    },
     upstream::{AcceptAll, UpstreamProxy},
 };
 use n0_error::{Result, StdResultExt};
@@ -135,12 +138,18 @@ async fn cmd_origin(port: u16) -> Result<()> {
 }
 
 async fn origin_server(listener: TcpListener) -> Result<()> {
-    use http_body_util::{BodyExt, Full, StreamBody};
-    use hyper::body::{Bytes, Frame};
-    use hyper::{Request, Response, service::service_fn};
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use hyper_util::server::conn::auto;
     use std::convert::Infallible;
+
+    use http_body_util::{BodyExt, Full, StreamBody};
+    use hyper::{
+        Request, Response,
+        body::{Bytes, Frame},
+        service::service_fn,
+    };
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto,
+    };
 
     type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
