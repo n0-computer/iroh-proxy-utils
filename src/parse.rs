@@ -277,10 +277,15 @@ impl HttpRequest {
                     Ok(HttpRequestKind::Tunnel)
                 }
             }
-            _ => match self.uri.scheme() {
-                None => Ok(HttpRequestKind::Origin),
-                Some(_) => Ok(HttpRequestKind::Absolute),
-            },
+            _ => {
+                // Absolute-form requests are only support for HTTP/1. In HTTP/2, absolute-form and origin-form
+                // requests are indistinguishable, so we always report origin-form.
+                if self.uri.scheme().is_some() && self.version < Version::HTTP_2 {
+                    Ok(HttpRequestKind::Absolute)
+                } else {
+                    Ok(HttpRequestKind::Origin)
+                }
+            }
         }
     }
 
