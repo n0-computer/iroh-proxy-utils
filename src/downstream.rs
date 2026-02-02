@@ -17,7 +17,7 @@ use iroh::{
     endpoint::{RecvStream, SendStream},
 };
 use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
-use n0_error::{AnyError, Result, anyerr, stack_error};
+use n0_error::{AnyError, Result, StdResultExt, anyerr, stack_error};
 use n0_future::TryStreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -193,6 +193,7 @@ impl DownstreamProxy {
                 .request_handler
                 .handle_request(src_addr, &mut request)
                 .await?;
+            debug!("destination: {destination}");
             // Connect to upstream and send the CONNECT request
             let mut conn = self.connect(destination).await?;
             request.write(&mut conn.send).await?;
@@ -213,7 +214,9 @@ impl DownstreamProxy {
                 // HTTP/1.1 path: after returning 200 OK, the connection is upgraded
                 // Spawn a task that waits for the upgrade and then handles bidirectional copy
                 tokio::spawn(async move {
-                    forward_upgrade(&mut conn, upgrade_fut).await;
+                    if let Err(err) = forward_hyper_upgrade(upgrade_fut, &mut conn).await {
+                        warn!("CONNECT upgrade failed: {err:#}");
+                    }
                 });
 
                 Ok(Response::builder()
@@ -227,13 +230,11 @@ impl DownstreamProxy {
                         debug!("CONNECT client->upstream pipe ended: {err:#}");
                     }
                 });
-                http1_response_to_hyper(response, conn.recv)
+                forward_upstream_response_to_hyper(response, conn.recv)
             }
         } else {
             let (parts, body) = req.into_parts();
             let mut request = HttpRequest::from_parts(parts);
-
-            debug!(?request, "get destination for");
             let destination = opts
                 .request_handler
                 .handle_request(src_addr, &mut request)
@@ -250,32 +251,27 @@ impl DownstreamProxy {
                 .await
                 .map_err(ProxyError::bad_gateway)?;
             info!(?response, "downstream read response");
-            http1_response_to_hyper(response, conn.recv)
+            forward_upstream_response_to_hyper(response, conn.recv)
         }
     }
 }
 
-async fn forward_upgrade(conn: &mut TunnelClientStreams, upgrade_fut: hyper::upgrade::OnUpgrade) {
-    match upgrade_fut.await {
-        Ok(upgraded) => {
-            let upgraded = TokioIo::new(upgraded);
-            // Split the upgraded connection for bidirectional copy
-            let (mut client_read, mut client_write) = tokio::io::split(upgraded);
-            if let Err(err) = forward_bidi(
-                &mut client_read,
-                &mut client_write,
-                &mut conn.recv,
-                &mut conn.send,
-            )
-            .await
-            {
-                debug!("CONNECT bidi copy ended: {err:#}");
-            }
-        }
-        Err(err) => {
-            warn!("CONNECT upgrade failed: {err:#}");
-        }
-    }
+async fn forward_hyper_upgrade(
+    upgrade_fut: hyper::upgrade::OnUpgrade,
+    conn: &mut TunnelClientStreams,
+) -> Result<()> {
+    let upgraded = upgrade_fut.await.std_context("HTTP/1 upgrade failed")?;
+    let upgraded = TokioIo::new(upgraded);
+    // Split the upgraded connection for bidirectional copy
+    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+    forward_bidi(
+        &mut client_read,
+        &mut client_write,
+        &mut conn.recv,
+        &mut conn.send,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Bidirectional streams for a single iroh tunnel.
@@ -359,7 +355,7 @@ impl ProxyError {
 
 type HyperBody = BoxBody<Bytes, io::Error>;
 
-fn http1_response_to_hyper(
+fn forward_upstream_response_to_hyper(
     response: HttpResponse,
     recv: Prebuffered<RecvStream>,
 ) -> Result<Response<HyperBody>, ProxyError> {
