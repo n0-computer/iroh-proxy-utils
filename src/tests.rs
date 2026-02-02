@@ -1034,6 +1034,128 @@ async fn h2_reqwest_forward() -> Result<()> {
     Ok(())
 }
 
+// -- Bug exposure tests --
+
+/// BUG: Hop-by-hop headers are forwarded to upstream when they shouldn't be.
+/// Per RFC 9110 Section 7.6.1, headers like Connection, Proxy-Authorization,
+/// Transfer-Encoding should NOT be forwarded.
+#[tokio::test]
+#[traced_test]
+async fn test_hop_by_hop_headers_not_forwarded() -> Result {
+    // Spawn an origin server that echoes back all received headers
+    let listener = TcpListener::bind("localhost:0").await?;
+    let origin_addr = listener.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+
+        // Echo back the received headers in the response body
+        let body = request.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    let _origin_task = AbortOnDropHandle::new(origin_task);
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Send request with hop-by-hop headers that should NOT be forwarded
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let req = format!(
+        "GET http://{origin_addr}/test HTTP/1.1\r\n\
+         Host: {origin_addr}\r\n\
+         Connection: keep-alive\r\n\
+         Proxy-Authorization: Basic secret\r\n\
+         Keep-Alive: timeout=5\r\n\
+         \r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+
+    let (status, body) = read_http_response(&mut stream).await?;
+    assert_eq!(status, 200);
+
+    let body_str = String::from_utf8_lossy(&body);
+    debug!("Origin received: {}", body_str);
+
+    // These hop-by-hop headers should NOT appear in what origin received
+    assert!(
+        !body_str.to_lowercase().contains("proxy-authorization"),
+        "Proxy-Authorization header was forwarded but shouldn't be"
+    );
+    assert!(
+        !body_str.to_lowercase().contains("keep-alive:"),
+        "Keep-Alive header was forwarded but shouldn't be"
+    );
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// BUG: Response hop-by-hop headers from origin are forwarded to client.
+/// The proxy should filter these out in responses as well.
+#[tokio::test]
+#[traced_test]
+async fn test_response_hop_by_hop_headers_filtered() -> Result {
+    // Spawn an origin that returns hop-by-hop headers in response
+    let listener = TcpListener::bind("localhost:0").await?;
+    let origin_addr = listener.local_addr()?;
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _n = stream.read(&mut buf).await.unwrap();
+
+        // Response with hop-by-hop headers that shouldn't be forwarded
+        let response = "HTTP/1.1 200 OK\r\n\
+            Content-Length: 2\r\n\
+            Connection: keep-alive\r\n\
+            Keep-Alive: timeout=5\r\n\
+            Proxy-Authenticate: Basic\r\n\
+            \r\nOK";
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    let _origin_task = AbortOnDropHandle::new(origin_task);
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let req = format!(
+        "GET http://{origin_addr}/test HTTP/1.1\r\n\
+         Host: {origin_addr}\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+
+    // Read raw response to check headers
+    let mut response_buf = vec![0u8; 4096];
+    let n = stream.read(&mut response_buf).await?;
+    let response_str = String::from_utf8_lossy(&response_buf[..n]);
+    debug!("Client received response: {}", response_str);
+
+    // These hop-by-hop headers should NOT be forwarded to client
+    let response_lower = response_str.to_lowercase();
+    assert!(
+        !response_lower.contains("proxy-authenticate"),
+        "Proxy-Authenticate response header was forwarded but shouldn't be"
+    );
+    assert!(
+        !response_lower.contains("keep-alive:"),
+        "Keep-Alive response header was forwarded but shouldn't be"
+    );
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
 mod origin_server {
     use std::{convert::Infallible, sync::Arc};
 

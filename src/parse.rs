@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, str::FromStr};
 
 use http::{
-    HeaderMap, HeaderValue, Method, StatusCode, Version,
+    HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version,
     header::{self, InvalidHeaderValue},
     uri::{Scheme, Uri},
 };
@@ -9,6 +9,51 @@ use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::util::Prebuffered;
+
+/// Hop-by-hop headers that MUST NOT be forwarded by proxies per RFC 9110 Section 7.6.1.
+const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
+    header::CONNECTION,
+    header::PROXY_AUTHENTICATE,
+    header::PROXY_AUTHORIZATION,
+    header::TE,
+    header::TRAILER,
+    header::TRANSFER_ENCODING,
+    header::UPGRADE,
+];
+
+/// Headers listed in the Connection header should also be removed.
+const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+
+/// Removes hop-by-hop headers from a HeaderMap per RFC 9110 Section 7.6.1.
+///
+/// This removes:
+/// - Connection and headers listed in the Connection header value
+/// - Proxy-Authenticate, Proxy-Authorization
+/// - TE, Trailer, Transfer-Encoding, Upgrade
+/// - Keep-Alive
+pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
+    // First, collect any header names listed in the Connection header
+    let connection_headers: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .filter_map(|name| name.trim().parse::<HeaderName>().ok())
+        .collect();
+
+    // Remove the standard hop-by-hop headers
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+
+    // Remove Keep-Alive (not in http crate's header constants)
+    headers.remove(&KEEP_ALIVE);
+
+    // Remove any headers that were listed in the Connection header
+    for name in connection_headers {
+        headers.remove(&name);
+    }
+}
 
 /// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]

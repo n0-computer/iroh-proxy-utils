@@ -20,7 +20,7 @@ use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
     HEADER_SECTION_MAX_LENGTH, HttpResponse,
-    parse::{HttpProxyRequestKind, HttpRequest},
+    parse::{HttpProxyRequestKind, HttpRequest, filter_hop_by_hop_headers},
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
 
@@ -185,15 +185,19 @@ impl UpstreamProxy {
             HttpProxyRequestKind::Absolute { method, target } => {
                 let body = recv_stream_to_body(recv);
 
+                // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
+                let mut headers = req.headers;
+                filter_hop_by_hop_headers(&mut headers);
+
                 // Forward the request to the upstream server.
-                let res = http_client
+                let mut res = http_client
                     .request(method, target)
-                    // TODO: Filter out hop-to-hop-headers that should not be forwarded to upstream.
-                    .headers(req.headers)
+                    .headers(headers)
                     .body(body)
                     .send()
                     .await
                     .anyerr()?;
+                filter_hop_by_hop_headers(res.headers_mut());
                 write_response_header(&res, &mut send).await?;
                 let mut body = res.bytes_stream();
                 while let Some(bytes) = body.next().await {
@@ -221,7 +225,8 @@ async fn write_response_header(res: &reqwest::Response, send: &mut SendStream) -
         res.status().canonical_reason().unwrap_or_default()
     );
     send.write_all(status_line.as_bytes()).await.anyerr()?;
-    for (name, value) in res.headers() {
+
+    for (name, value) in res.headers().iter() {
         send.write_all(name.as_str().as_bytes()).await.anyerr()?;
         send.write_all(b": ").await.anyerr()?;
         send.write_all(value.as_bytes()).await.anyerr()?;
