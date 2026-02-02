@@ -5,12 +5,11 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use iroh::{Endpoint, EndpointId, protocol::Router};
+use iroh_proxy_utils::HttpRequest;
+use iroh_proxy_utils::downstream::{Deny, RequestHandler, StaticForwardProxy, StaticReverseProxy};
 use iroh_proxy_utils::{
-    ALPN, Authority, HttpProxyRequest, IROH_DESTINATION_HEADER,
-    downstream::{
-        DownstreamProxy, EndpointAuthority, ExtractError, ForwardProxyMode, ForwardProxyResolver,
-        HttpProxyOpts, ProxyMode, ReverseProxyMode,
-    },
+    ALPN, Authority, IROH_DESTINATION_HEADER,
+    downstream::{DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode},
     upstream::{AcceptAll, UpstreamProxy},
 };
 use n0_error::{Result, StdResultExt};
@@ -236,8 +235,7 @@ async fn cmd_reverse_proxy(port: u16, upstream: EndpointId, origin: String) -> R
     let addr = listener.local_addr()?;
     let authority = Authority::from_authority_str(&origin)?;
     let destination = EndpointAuthority::new(upstream, authority);
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     println!("reverse proxy listening on {addr}");
     tokio::select! {
         res = proxy.forward_tcp_listener(listener, mode) => res?,
@@ -249,16 +247,25 @@ async fn cmd_reverse_proxy(port: u16, upstream: EndpointId, origin: String) -> R
 
 // -- Forward proxy --
 
-struct IrohDestinationResolver;
+struct HeaderResolver;
 
-impl ForwardProxyResolver for IrohDestinationResolver {
-    async fn destination(&self, req: &HttpProxyRequest) -> Result<EndpointId, ExtractError> {
+impl RequestHandler for HeaderResolver {
+    async fn handle_request(
+        &self,
+        src_addr: SocketAddr,
+        req: &mut HttpRequest,
+    ) -> Result<EndpointId, Deny> {
         let header = req
             .headers
             .get(IROH_DESTINATION_HEADER)
-            .ok_or(ExtractError::BadRequest)?;
-        let header_str = header.to_str().map_err(|_| ExtractError::BadRequest)?;
-        EndpointId::from_str(header_str).map_err(|_| ExtractError::BadRequest)
+            .ok_or_else(|| Deny::bad_request("missing iroh-destination header"))?;
+        let header_str = header
+            .to_str()
+            .std_context("invalid iroh-destination header")
+            .map_err(Deny::bad_request)?;
+        let destination = EndpointId::from_str(header_str).map_err(Deny::bad_request)?;
+        req.set_forwarded_for(src_addr);
+        Ok(destination)
     }
 }
 
@@ -267,7 +274,7 @@ async fn cmd_forward_proxy(port: u16) -> Result<()> {
     let proxy = DownstreamProxy::new(endpoint, Default::default());
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     let addr = listener.local_addr()?;
-    let mode = ProxyMode::Http(HttpProxyOpts::default().forward(IrohDestinationResolver));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(HeaderResolver));
     println!("forward proxy listening on {addr}");
     tokio::select! {
         res = proxy.forward_tcp_listener(listener, mode) => res?,
@@ -318,8 +325,7 @@ async fn spawn_bench_server(
     let forward_proxy = DownstreamProxy::new(forward_endpoint.clone(), Default::default());
     let forward_listener = TcpListener::bind(format!("127.0.0.1:{forward_port}")).await?;
     let forward_addr = forward_listener.local_addr()?;
-    let forward_mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let forward_mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     tokio::spawn(async move {
         if let Err(e) = forward_proxy
             .forward_tcp_listener(forward_listener, forward_mode)
@@ -336,8 +342,7 @@ async fn spawn_bench_server(
     let reverse_addr = reverse_listener.local_addr()?;
     let authority = Authority::from_authority_str(&origin_addr.to_string())?;
     let destination = EndpointAuthority::new(upstream_id, authority);
-    let reverse_mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let reverse_mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     tokio::spawn(async move {
         if let Err(e) = reverse_proxy
             .forward_tcp_listener(reverse_listener, reverse_mode)

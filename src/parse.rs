@@ -1,13 +1,14 @@
-use std::str::FromStr;
+use std::{net::SocketAddr, str::FromStr};
 
 use http::{
-    HeaderMap, HeaderValue, Method, StatusCode,
+    HeaderMap, HeaderValue, Method, StatusCode, Version,
+    header::{self, InvalidHeaderValue},
     uri::{Scheme, Uri},
 };
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::{downstream::EndpointAuthority, util::Prebuffered};
+use crate::util::Prebuffered;
 
 /// Host and port authority parsed from HTTP request targets.
 #[derive(Debug, Clone, derive_more::Display)]
@@ -83,73 +84,64 @@ impl Authority {
     }
 }
 
-/// Parsed request target classification per RFC 9110.
 #[derive(Debug)]
-pub enum HttpRequestKind {
-    /// CONNECT authority-form or absolute-form proxy request.
-    Proxy(HttpProxyRequestKind),
-    /// Direct origin request with origin-form request target.
-    Origin {
-        /// Origin-form path component.
-        path: String,
-        /// HTTP method from the request line.
-        method: Method,
-    },
-}
-
-/// Proxy request targets per RFC 9110.
-#[derive(Debug)]
-pub enum HttpProxyRequestKind {
-    /// Tunnel CONNECT request with authority-form request target.
-    Tunnel { target: Authority },
-    /// Forward-proxy request with absolute-form request target.
-    Absolute { target: String, method: Method },
-}
-
-/// Parsed HTTP proxy request with headers.
-#[derive(derive_more::Debug)]
-pub struct HttpProxyRequest {
-    /// Parsed proxy request target.
-    pub kind: HttpProxyRequestKind,
-    /// Raw header map as received.
-    pub headers: HeaderMap<http::HeaderValue>,
-}
-
-/// Parsed HTTP request with headers and request target classification.
-#[derive(Debug)]
-pub enum HttpRequest {
-    Forward(HttpProxyRequest),
-    Origin(HttpOriginRequest),
-}
-
-#[derive(Debug)]
-pub struct HttpOriginRequest {
-    /// Origin-form path component.
-    pub path: String,
-    /// HTTP method from the request line.
+pub struct HttpRequest {
+    pub version: Version,
+    pub headers: HeaderMap<HeaderValue>,
+    pub uri: Uri,
     pub method: Method,
-    /// Raw header map as received.
-    pub headers: HeaderMap<http::HeaderValue>,
 }
 
-impl HttpOriginRequest {
-    pub fn host(&self) -> Option<&str> {
-        self.headers.get("host").and_then(|x| x.to_str().ok())
-    }
-
-    pub fn to_absolute(self, destination: &EndpointAuthority) -> HttpProxyRequest {
-        let absolute_uri = format!("http://{}{}", destination.authority, self.path);
-        HttpProxyRequest {
-            kind: HttpProxyRequestKind::Absolute {
-                target: absolute_uri,
-                method: self.method,
-            },
-            headers: self.headers,
-        }
-    }
-}
+const X_FORWARDED_FOR: &str = "x-forwarded-for";
+const X_FORWARDED_HOST: &str = "x-forwarded-host";
 
 impl HttpRequest {
+    pub fn from_parts(parts: http::request::Parts) -> Self {
+        Self {
+            version: parts.version,
+            headers: parts.headers,
+            method: parts.method,
+            uri: parts.uri,
+        }
+    }
+
+    /// Parses a request from a buffer and returns `None` when incomplete.
+    ///
+    /// Returns the length of the header section and the request.
+    pub fn parse_with_len(buf: &[u8]) -> Result<Option<(usize, Self)>> {
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(buf).std_context("Invalid HTTP request")? {
+            httparse::Status::Partial => Ok(None),
+            httparse::Status::Complete(header_len) => {
+                Self::from_parsed_request(req).map(|req| Some((header_len, req)))
+            }
+        }
+    }
+
+    pub fn from_parsed_request(req: httparse::Request) -> Result<Self> {
+        let method_str = req.method.context("Missing HTTP method")?;
+        let method = method_str.parse().std_context("Invalid HTTP method")?;
+        let path = req.path.context("Missing request target")?;
+        let uri = Uri::from_str(path).std_context("Invalid request target")?;
+        let headers = HeaderMap::from_iter(req.headers.iter_mut().flat_map(|h| {
+            let value = HeaderValue::from_bytes(h.value).ok()?;
+            let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
+            Some((name, value))
+        }));
+        let version = if req.version == Some(1) {
+            http::Version::HTTP_11
+        } else {
+            http::Version::HTTP_10
+        };
+        Ok(Self {
+            version,
+            headers,
+            uri,
+            method,
+        })
+    }
+
     /// Reads and parses the request line and header section.
     ///
     /// Does not remove the header section from `reader`.
@@ -187,82 +179,88 @@ impl HttpRequest {
         Ok(Self::parse_with_len(buf)?.map(|(_len, req)| req))
     }
 
-    /// Parses a request from a buffer and returns `None` when incomplete.
-    ///
-    /// Returns the length of the header section and the request.
-    pub fn parse_with_len(buf: &[u8]) -> Result<Option<(usize, Self)>> {
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut req = httparse::Request::new(&mut headers);
-        match req.parse(buf).std_context("Invalid HTTP request")? {
-            httparse::Status::Partial => Ok(None),
-            httparse::Status::Complete(header_len) => {
-                Self::from_request(req).map(|req| Some((header_len, req)))
-            }
-        }
-    }
-
-    pub fn from_request(req: httparse::Request) -> Result<Self> {
-        let method_str = req.method.context("Missing HTTP method")?;
-        let method = method_str.parse().std_context("Invalid HTTP method")?;
-        let path = req.path.context("Missing request target")?;
-        let uri = Uri::from_str(path).std_context("Invalid request target")?;
-        let headers = HeaderMap::from_iter(req.headers.iter_mut().flat_map(|h| {
-            let value = HeaderValue::from_bytes(h.value).ok()?;
-            let name = http::HeaderName::from_bytes(h.name.as_bytes()).ok()?;
-            Some((name, value))
-        }));
-        Self::from_parts(method, uri, headers)
-    }
-
-    pub fn from_http_parts(parts: http::request::Parts) -> Result<Self> {
-        Self::from_parts(parts.method, parts.uri, parts.headers)
-    }
-
-    pub fn from_parts(method: Method, uri: Uri, headers: HeaderMap<HeaderValue>) -> Result<Self> {
-        let request = match method {
-            Method::CONNECT => {
-                let authority = Authority::from_authority_uri(&uri)?;
-                Self::Forward(HttpProxyRequest {
-                    kind: HttpProxyRequestKind::Tunnel { target: authority },
-                    headers,
-                })
-            }
-            _ => {
-                if uri.scheme().is_some() {
-                    Self::Forward(HttpProxyRequest {
-                        kind: HttpProxyRequestKind::Absolute {
-                            target: uri.to_string(),
-                            method,
-                        },
-                        headers,
-                    })
-                } else {
-                    Self::Origin(HttpOriginRequest {
-                        path: uri.to_string(),
-                        method,
-                        headers,
-                    })
-                }
-            }
-        };
-        Ok(request)
-    }
-
     /// Converts to a proxy request when the target is authority-form or absolute-form.
     ///
     /// Note: origin-form requests return an error.
     pub fn try_into_proxy_request(self) -> Result<HttpProxyRequest> {
-        match self {
-            Self::Forward(inner) => Ok(inner),
-            Self::Origin(_) => Err(anyerr!("Request is origin-form and not a proxy request")),
+        let kind = match self.method {
+            Method::CONNECT => {
+                let target = Authority::from_authority_uri(&self.uri)?;
+                HttpProxyRequestKind::Tunnel { target }
+            }
+            _ => {
+                if self.uri.scheme().is_none() || self.uri.authority().is_none() {
+                    return Err(anyerr!("Missing absolute-form request target"));
+                }
+                let target = self.uri.to_string();
+                HttpProxyRequestKind::Absolute {
+                    target,
+                    method: self.method,
+                }
+            }
+        };
+        Ok(HttpProxyRequest {
+            headers: self.headers,
+            kind,
+        })
+    }
+
+    pub fn host(&self) -> Option<&str> {
+        self.headers
+            .get(http::header::HOST)
+            .and_then(|x| x.to_str().ok())
+    }
+
+    pub fn set_forwarded_for(&mut self, src_addr: SocketAddr) -> &mut Self {
+        self.headers.append(
+            X_FORWARDED_FOR,
+            HeaderValue::from_str(&src_addr.to_string()).expect("valid header value"),
+        );
+        self
+    }
+
+    pub fn set_via(
+        &mut self,
+        pseudonym: impl std::fmt::Display,
+    ) -> Result<&mut Self, InvalidHeaderValue> {
+        self.headers.append(
+            header::VIA,
+            HeaderValue::from_str(&format!("{:?} {}", self.version, pseudonym))?,
+        );
+        Ok(self)
+    }
+
+    pub fn set_target(&mut self, target: Uri) -> Result<&mut Self, InvalidHeaderValue> {
+        if let Some(original_host) = self.headers.remove(header::HOST) {
+            self.headers.insert(X_FORWARDED_HOST, original_host);
         }
+        if let Some(authority) = target.authority() {
+            self.headers
+                .insert(header::HOST, HeaderValue::from_str(authority.as_str())?);
+        }
+        self.uri = target;
+        Ok(self)
+    }
+
+    pub fn set_http_authority(&mut self, authority: Authority) -> Result<&mut Self> {
+        let mut parts = self.uri.clone().into_parts();
+        parts.authority = Some(authority.to_string().parse().anyerr()?);
+        parts.scheme = Some(Scheme::HTTP);
+        let uri = Uri::from_parts(parts).anyerr()?;
+        self.set_target(uri).anyerr()?;
+        Ok(self)
     }
 
     pub(crate) async fn write(
         self,
         writer: &mut (impl AsyncWrite + Send + Unpin),
     ) -> io::Result<()> {
-        let (method, uri, headers) = self.into_parts();
+        let Self {
+            method,
+            uri,
+            headers,
+            ..
+        } = self;
         writer.write_all(method.as_str().as_bytes()).await?;
         writer.write_all(b" ").await?;
         if let Some(s) = uri.scheme() {
@@ -287,43 +285,24 @@ impl HttpRequest {
         writer.write_all(b"\r\n").await?;
         Ok(())
     }
+}
 
-    // pub(crate) async fn write_finalize(
-    //     self,
-    //     writer: &mut (impl AsyncWrite + Send + Unpin),
-    // ) -> io::Result<()> {
-    //     self.write(writer).await?;
-    //     writer.write_all(b"\r\n").await?;
-    //     Ok(())
-    // }
+/// Proxy request targets per RFC 9110.
+#[derive(Debug)]
+pub enum HttpProxyRequestKind {
+    /// Tunnel CONNECT request with authority-form request target.
+    Tunnel { target: Authority },
+    /// Forward-proxy request with absolute-form request target.
+    Absolute { target: String, method: Method },
+}
 
-    pub fn into_parts(self) -> (Method, Uri, HeaderMap<HeaderValue>) {
-        let (method, uri, headers) = match self {
-            HttpRequest::Forward(HttpProxyRequest { kind, headers }) => match kind {
-                HttpProxyRequestKind::Tunnel { target } => {
-                    let uri = Uri::try_from(target.to_string()).unwrap();
-                    (Method::CONNECT, uri, headers)
-                }
-                HttpProxyRequestKind::Absolute { target, method } => {
-                    let uri = Uri::try_from(target).unwrap();
-                    (method, uri, headers)
-                }
-            },
-            HttpRequest::Origin(HttpOriginRequest {
-                path,
-                method,
-                headers,
-            }) => {
-                let uri = Uri::try_from(path).unwrap_or_default();
-                (method, uri, headers)
-            }
-        };
-        (method, uri, headers)
-        // let mut builder = http::Request::builder().method(method).uri(uri);
-        // let builder_headers = builder.headers_mut().unwrap();
-        // *builder_headers = headers;
-        // builder
-    }
+/// Parsed HTTP proxy request with headers.
+#[derive(derive_more::Debug)]
+pub struct HttpProxyRequest {
+    /// Parsed proxy request target.
+    pub kind: HttpProxyRequestKind,
+    /// Raw header map as received.
+    pub headers: HeaderMap<http::HeaderValue>,
 }
 
 /// Parsed HTTP response with status, reason, and headers.

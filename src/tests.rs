@@ -16,11 +16,11 @@ use tokio_util::time::FutureExt;
 use tracing::debug;
 
 use crate::{
-    ALPN, Authority, HttpOriginRequest, HttpProxyRequest, HttpProxyRequestKind, HttpResponse,
+    ALPN, Authority, HttpProxyRequest, HttpProxyRequestKind, HttpRequest, HttpResponse,
     IROH_DESTINATION_HEADER,
     downstream::{
-        DownstreamProxy, EndpointAuthority, ExtractError, ForwardProxyMode, ForwardProxyResolver,
-        HttpProxyOpts, ProxyMode, ReverseProxyMode, ReverseProxyResolver,
+        Deny, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode, RequestHandler,
+        opts::{RequestHandlerChain, StaticForwardProxy, StaticReverseProxy},
     },
     upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
     util::Prebuffered,
@@ -174,14 +174,23 @@ async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<(u1
 /// Extracts the endpoint id from Iroh-Destination header.
 struct HeaderResolver;
 
-impl ForwardProxyResolver for HeaderResolver {
-    async fn destination(&self, req: &HttpProxyRequest) -> Result<EndpointId, ExtractError> {
+impl RequestHandler for HeaderResolver {
+    async fn handle_request(
+        &self,
+        src_addr: SocketAddr,
+        req: &mut HttpRequest,
+    ) -> Result<EndpointId, Deny> {
         let header = req
             .headers
             .get(IROH_DESTINATION_HEADER)
-            .ok_or(ExtractError::BadRequest)?;
-        let header_str = header.to_str().map_err(|_| ExtractError::BadRequest)?;
-        EndpointId::from_str(header_str).map_err(|_| ExtractError::BadRequest)
+            .ok_or_else(|| Deny::bad_request("missing iroh-destination header"))?;
+        let header_str = header
+            .to_str()
+            .std_context("invalid iroh-destination header")
+            .map_err(Deny::bad_request)?;
+        let destination = EndpointId::from_str(header_str).map_err(Deny::bad_request);
+        req.set_forwarded_for(src_addr);
+        destination
     }
 }
 
@@ -190,17 +199,27 @@ struct SubdomainRouter {
     routes: HashMap<String, EndpointAuthority>,
 }
 
-impl ReverseProxyResolver for SubdomainRouter {
-    async fn destination(
+impl RequestHandler for SubdomainRouter {
+    async fn handle_request(
         &self,
-        req: &HttpOriginRequest,
-    ) -> Result<EndpointAuthority, ExtractError> {
-        let host = req.host().ok_or(ExtractError::BadRequest)?;
-        let subdomain = host.split('.').next().ok_or(ExtractError::BadRequest)?;
-        self.routes
+        _src_addr: SocketAddr,
+        req: &mut HttpRequest,
+    ) -> Result<EndpointId, Deny> {
+        let host = req
+            .host()
+            .ok_or_else(|| Deny::bad_request("missing host header"))?;
+        let subdomain = host
+            .split('.')
+            .next()
+            .ok_or_else(|| Deny::bad_request("invalid host header"))?;
+        let destination = self
+            .routes
             .get(subdomain)
             .cloned()
-            .ok_or(ExtractError::NotFound)
+            .ok_or_else(|| Deny::new(StatusCode::NOT_FOUND, "unknown subdomain"))?;
+        req.set_http_authority(destination.authority)
+            .map_err(|err| Deny::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        Ok(destination.endpoint_id)
     }
 }
 
@@ -284,8 +303,7 @@ async fn test_http_forward_absolute_form() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Use reqwest with proxy - it uses absolute-form for HTTP
@@ -313,8 +331,7 @@ async fn test_http_forward_connect() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, origin_task) = spawn_origin_server("origin").await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let mut stream = create_http_connect_tunnel(proxy_addr, origin_addr, None).await?;
@@ -343,8 +360,7 @@ async fn test_http_reverse_simple() -> Result {
         upstream_id,
         Authority::from_authority_str(&origin_addr.to_string())?,
     );
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Direct request to reverse proxy (no proxy config - sends origin-form)
@@ -374,7 +390,7 @@ async fn test_http_forward_absolute_dynamic() -> Result {
     let (upstream2_router, upstream2_id) = spawn_upstream_proxy().await?;
     let (origin2_addr, _origin2_task) = spawn_origin_server("beta").await?;
 
-    let mode = ProxyMode::Http(HttpProxyOpts::default().forward(HeaderResolver));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(HeaderResolver));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Request routed to upstream1 -> origin1 (alpha)
@@ -413,7 +429,7 @@ async fn test_http_forward_absolute_dynamic() -> Result {
 #[tokio::test]
 #[traced_test]
 async fn test_http_forward_dynamic_missing_header() -> Result {
-    let mode = ProxyMode::Http(HttpProxyOpts::default().forward(HeaderResolver));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(HeaderResolver));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Request without Iroh-Destination header should fail
@@ -459,7 +475,7 @@ async fn test_http_reverse_dynamic() -> Result {
         ),
     );
 
-    let mode = ProxyMode::Http(HttpProxyOpts::default().reverse(SubdomainRouter { routes }));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(SubdomainRouter { routes }));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Request with Host: proxy1.example.com -> should hit server1
@@ -490,7 +506,7 @@ async fn test_http_reverse_dynamic() -> Result {
 #[traced_test]
 async fn test_http_reverse_dynamic_unknown_subdomain() -> Result {
     let routes = HashMap::new(); // Empty routes
-    let mode = ProxyMode::Http(HttpProxyOpts::default().reverse(SubdomainRouter { routes }));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(SubdomainRouter { routes }));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::new();
@@ -512,7 +528,7 @@ async fn test_upstream_auth_endpoint() -> Result {
     let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
     // First spawn downstream to get its endpoint ID
-    let mode_placeholder = ProxyMode::Http(HttpProxyOpts::default().forward(HeaderResolver));
+    let mode_placeholder = ProxyMode::Http(HttpProxyOpts::new(HeaderResolver));
     let (proxy_addr, downstream_id, proxy_task) = spawn_downstream_proxy(mode_placeholder).await?;
 
     // Upstream that only allows this specific downstream
@@ -534,7 +550,7 @@ async fn test_upstream_auth_endpoint() -> Result {
 
     // Spawn another downstream (different endpoint ID) - should be rejected
     let (proxy_addr2, _, proxy_task2) = spawn_downstream_proxy(ProxyMode::Http(
-        HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)),
+        HttpProxyOpts::new(StaticForwardProxy(upstream_id)),
     ))
     .await?;
 
@@ -572,8 +588,7 @@ async fn test_upstream_auth_authority() -> Result {
         spawn_upstream_proxy_with_auth(AllowAuthorities(vec![allowed_addr.to_string()])).await?;
 
     // Downstream forward proxy using CONNECT
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // CONNECT to allowed origin should succeed
@@ -606,8 +621,7 @@ async fn test_http_forward_post_with_body() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server_echo_body("origin").await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::builder()
@@ -639,8 +653,7 @@ async fn test_http_reverse_post_with_body() -> Result {
         upstream_id,
         Authority::from_authority_str(&origin_addr.to_string())?,
     );
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::new();
@@ -675,8 +688,7 @@ async fn test_http_reverse_post_with_body() -> Result {
 async fn test_invalid_http_request() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send garbage that's not valid HTTP
@@ -698,8 +710,7 @@ async fn test_origin_form_to_forward_only_proxy() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
 
     // Only forward mode configured (no reverse)
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send origin-form request (no scheme) - this is what a reverse proxy would handle
@@ -728,8 +739,7 @@ async fn test_forward_request_to_reverse_only_proxy() -> Result {
         Authority::from_authority_str(&origin_addr.to_string())?,
     );
     // Only reverse mode configured (no forward)
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send absolute-form request (with scheme) - this is what a forward proxy would handle
@@ -759,8 +769,7 @@ async fn test_connect_to_reverse_only_proxy() -> Result {
         Authority::from_authority_str(&origin_addr.to_string())?,
     );
     // Only reverse mode configured
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Send CONNECT request
@@ -782,8 +791,7 @@ async fn test_connect_to_reverse_only_proxy() -> Result {
 async fn test_connect_unreachable_origin() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // CONNECT to a port that's not listening
@@ -806,8 +814,7 @@ async fn test_concurrent_requests() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::builder()
@@ -844,8 +851,7 @@ async fn test_large_request_body() -> Result {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server_echo_body("origin").await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::builder()
@@ -881,11 +887,10 @@ async fn test_forward_and_reverse_combined() -> Result {
         upstream_id,
         Authority::from_authority_str(&reverse_origin_addr.to_string())?,
     );
-    let mode = ProxyMode::Http(
-        HttpProxyOpts::default()
-            .forward(ForwardProxyMode::Static(upstream_id))
-            .reverse(ReverseProxyMode::Static(reverse_destination)),
-    );
+    let handler = RequestHandlerChain::default()
+        .push(StaticForwardProxy(upstream_id))
+        .push(StaticReverseProxy(reverse_destination));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(handler));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(mode).await?;
 
     // Absolute-form request should go to forward origin
@@ -933,7 +938,7 @@ async fn h2_multiple_connect_requests_single_connection() -> Result<()> {
 
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
-    let opts = HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id));
+    let opts = HttpProxyOpts::new(StaticForwardProxy(upstream_id));
     let (proxy_addr, _, proxy_task) = spawn_downstream_proxy(ProxyMode::Http(opts)).await?;
 
     let stream = TcpStream::connect(proxy_addr).await?;
@@ -981,8 +986,7 @@ async fn h2_reqwest_reverse() -> Result<()> {
         upstream_id,
         Authority::from_authority_str(&origin_addr.to_string())?,
     );
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().reverse(ReverseProxyMode::Static(destination)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::builder()
@@ -1009,8 +1013,7 @@ async fn h2_reqwest_forward() -> Result<()> {
     let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
     let (origin_addr, _origin_task) = spawn_origin_server("origin").await?;
 
-    let mode =
-        ProxyMode::Http(HttpProxyOpts::default().forward(ForwardProxyMode::Static(upstream_id)));
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
     let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
 
     let client = reqwest::Client::builder()

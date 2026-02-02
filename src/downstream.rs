@@ -1,7 +1,7 @@
-use std::{convert::Infallible, fmt::Debug, io};
+use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr};
 
 use bytes::Bytes;
-use http::{HeaderValue, StatusCode};
+use http::{HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
 use hyper::{
     Request, Response,
@@ -24,12 +24,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
 
 pub use self::opts::{
-    ExtractError, ForwardProxyMode, ForwardProxyResolver, HttpProxyOpts, PoolOpts, ProxyMode,
-    ReverseProxyMode, ReverseProxyResolver, WriteErrorResponse,
+    Deny, ErrorResponder, HttpProxyOpts, PoolOpts, ProxyMode, RequestHandler, RequestHandlerChain,
+    StaticForwardProxy, StaticReverseProxy,
 };
 use crate::{
-    ALPN, Authority, HEADER_SECTION_MAX_LENGTH, HttpOriginRequest, HttpProxyRequest,
-    HttpProxyRequestKind,
+    ALPN, Authority, HEADER_SECTION_MAX_LENGTH,
     parse::{HttpRequest, HttpResponse},
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
@@ -81,11 +80,6 @@ impl DownstreamProxy {
     ///
     /// Runs indefinitely until the listener errors or the task is cancelled.
     pub async fn forward_tcp_listener(&self, listener: TcpListener, mode: ProxyMode) -> Result<()> {
-        // match mode {
-        //     ProxyMode::Tcp(endpoint_authority) => {}
-        //     ProxyMode::Http(http_proxy_opts) => todo!(),
-        // }
-        // self.forward_h2_listener(listener, mode).await
         let cancel_token = CancellationToken::new();
         let _cancel_guard = cancel_token.clone().drop_guard();
         let mut id = 0;
@@ -98,7 +92,9 @@ impl DownstreamProxy {
                     .child_token()
                     .run_until_cancelled_owned(async move {
                         debug!(%client_addr, "accepted TCP connection");
-                        this.forward_tcp_stream(client_stream, &mode).await.ok();
+                        this.forward_tcp_stream(client_addr, client_stream, &mode)
+                            .await
+                            .ok();
                     })
                     .instrument(error_span!("tcp-accept", id)),
             );
@@ -112,7 +108,12 @@ impl DownstreamProxy {
     /// to the configured [`HttpProxyOpts`].
     /// For [`ProxyMode::Tcp`], this creates a CONNECT tunnel to the configured upstream and authority, and forwards the TCP
     /// stream without parsing anything.
-    pub async fn forward_tcp_stream(&self, tcp_stream: TcpStream, mode: &ProxyMode) -> Result<()> {
+    async fn forward_tcp_stream(
+        &self,
+        src_addr: SocketAddr,
+        tcp_stream: TcpStream,
+        mode: &ProxyMode,
+    ) -> Result<()> {
         match mode {
             ProxyMode::Tcp(destination) => {
                 if let Err(err) = self
@@ -128,7 +129,18 @@ impl DownstreamProxy {
                 let service = service_fn(move |req| {
                     let this = this.clone();
                     let opts = opts.clone();
-                    async move { Ok::<_, Infallible>(this.handle_hyper_request(req, opts).await) }
+                    async move {
+                        match this.handle_hyper_request(src_addr, req, &opts).await {
+                            Ok(res) => Ok::<_, Infallible>(res),
+                            Err(err) => {
+                                warn!("Error while forwarding HTTP/2 request: {err:#}");
+                                let status =
+                                    err.response_status().unwrap_or(StatusCode::BAD_GATEWAY);
+                                let res = opts.error_response(status).await;
+                                Ok(res)
+                            }
+                        }
+                    }
                 });
                 // Enable upgrades for HTTP/1.1 CONNECT support
                 let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -143,22 +155,6 @@ impl DownstreamProxy {
             }
         }
         Ok(())
-        // if let Err(err) = self.forward_tcp_stream_inner(&mut conn, mode).await {
-        //     warn!("Error while forwarding TCP stream: {err:#}");
-        //     // If this is a HTTP proxy, write an error response if the error is a proxy error.
-        //     if let ProxyMode::Http(opts) = mode
-        //         && let Some(response) = err.to_response()
-        //     {
-        //         debug!(?response, "send error response");
-        //         if let Err(err) = opts.write_error_response(&response, &mut conn).await {
-        //             debug!("failed to send error response: {err:#}");
-        //         }
-        //     }
-        //     Err(err.into())
-        // } else {
-        //     debug!("Forwarded stream closed");
-        //     Ok(())
-        // }
     }
 
     pub async fn forward_tcp_stream_to_tunnel(
@@ -189,221 +185,106 @@ impl DownstreamProxy {
         Ok(TunnelClientStreams { send, recv, conn })
     }
 
-    /// Handles CONNECT requests for HTTP/1.1 and HTTP/2.
-    ///
-    /// For CONNECT, we create a tunnel to the upstream and then set up bidirectional streaming
-    /// between the client and the upstream through the tunnel.
-    async fn handle_connect_request(
-        &self,
-        destination: EndpointId,
-        request: HttpProxyRequest,
-        body: Incoming,
-        upgrade_fut: Option<hyper::upgrade::OnUpgrade>,
-    ) -> Result<Response<HyperBody>, ProxyError> {
-        // Connect to upstream and send the CONNECT request
-        let mut conn = self.connect(destination).await?;
-        HttpRequest::Forward(request)
-            .write(&mut conn.send)
-            .await
-            .map_err(ProxyError::io)?;
-
-        // Read the response from upstream
-        let response = HttpResponse::read(&mut conn.recv)
-            .await
-            .map_err(ProxyError::bad_gateway)?;
-        debug!(?response, "upstream CONNECT response");
-
-        if response.status != StatusCode::OK {
-            // Forward the error response from upstream
-            return Ok(h2_error_response(response.status));
-        }
-
-        // For HTTP/1.1, use the upgrade mechanism
-        // For HTTP/2, use the body streams
-        if let Some(upgrade_fut) = upgrade_fut {
-            // HTTP/1.1 path: after returning 200 OK, the connection is upgraded
-            // Spawn a task that waits for the upgrade and then handles bidirectional copy
-            tokio::spawn(async move {
-                match upgrade_fut.await {
-                    Ok(upgraded) => {
-                        let upgraded = TokioIo::new(upgraded);
-                        // Split the upgraded connection for bidirectional copy
-                        let (mut client_read, mut client_write) = tokio::io::split(upgraded);
-                        if let Err(err) = forward_bidi(
-                            &mut client_read,
-                            &mut client_write,
-                            &mut conn.recv,
-                            &mut conn.send,
-                        )
-                        .await
-                        {
-                            debug!("CONNECT bidi copy ended: {err:#}");
-                        }
-                    }
-                    Err(err) => {
-                        warn!("CONNECT upgrade failed: {err:#}");
-                    }
-                }
-            });
-
-            // Return 200 OK - the actual tunnel data flows after the upgrade
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(Empty::new().map_err(infallible_to_io).boxed())
-                .unwrap())
-        } else {
-            // HTTP/2 path: request body and response body are the bidirectional tunnel
-            tokio::spawn(async move {
-                if let Err(err) = forward_hyper_body(body, &mut conn.send).await {
-                    debug!("CONNECT client->upstream pipe ended: {err:#}");
-                }
-            });
-            http1_response_to_hyper(response, conn.recv)
-        }
-    }
-
     async fn handle_hyper_request(
         &self,
-        req: Request<Incoming>,
-        opts: HttpProxyOpts,
-    ) -> Response<HyperBody> {
-        match self.handle_hyper_request_inner(req, &opts).await {
-            Ok(res) => res,
-            Err(err) => {
-                warn!("Error while forwarding HTTP/2 request: {err:#}");
-                let status = err.response_status().unwrap_or(StatusCode::BAD_GATEWAY);
-                h2_error_response(status)
-                // TODO: Use opts.error_response / adapt the traits to return sth that hyper can send
-                //         if let Err(err) = opts.write_error_response(&response, &mut conn).await {
-                //             debug!("failed to send error response: {err:#}");
-                //         }
-                //     }
-            }
-        }
-    }
-
-    async fn handle_hyper_request_inner(
-        &self,
+        src_addr: SocketAddr,
         mut req: Request<Incoming>,
         opts: &HttpProxyOpts,
     ) -> Result<Response<HyperBody>, ProxyError> {
-        // Check if this is a CONNECT request that might need HTTP/1.1 upgrade handling
-        let is_connect = req.method() == http::Method::CONNECT;
-        let upgrade_fut = if is_connect {
-            // For HTTP/1.1 CONNECT, we need to handle the upgrade after sending 200 OK
-            Some(hyper::upgrade::on(&mut req))
-        } else {
-            None
-        };
+        debug!("handling request: {req:?}");
 
-        let (parts, body) = req.into_parts();
-        let version = parts.version;
-        let request = HttpRequest::from_http_parts(parts).map_err(ProxyError::bad_request)?;
+        if req.method() == Method::CONNECT {
+            let upgrade = if req.version() < http::Version::HTTP_2 {
+                Some(hyper::upgrade::on(&mut req))
+            } else {
+                None
+            };
 
-        // In HTTP/2, the :scheme pseudo-header is always present, so all non-CONNECT requests
-        // are classified as absolute-form (forward proxy). When reverse mode is configured,
-        // reclassify absolute-form requests as origin-form for reverse proxy routing.
-        // CONNECT (tunnel) requests are never reclassified.
-        let request = if version == http::Version::HTTP_2 {
-            match request {
-                HttpRequest::Forward(HttpProxyRequest {
-                    kind: HttpProxyRequestKind::Absolute { target, method },
-                    mut headers,
-                }) if opts.as_reverse().is_ok() => {
-                    let uri: http::Uri = target
-                        .parse()
-                        .map_err(|e: http::uri::InvalidUri| ProxyError::bad_request(anyerr!(e)))?;
-                    let path = uri
-                        .path_and_query()
-                        .map(|pq| pq.to_string())
-                        .unwrap_or_else(|| "/".to_string());
-                    // Ensure host header is set from URI authority for reverse proxy resolvers.
-                    if !headers.contains_key(http::header::HOST) {
-                        if let Some(authority) = uri.authority() {
-                            if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
-                                headers.insert(http::header::HOST, value);
-                            }
-                        }
-                    }
-                    HttpRequest::Origin(HttpOriginRequest {
-                        path,
-                        method,
-                        headers,
-                    })
-                }
-                other => other,
+            let (parts, body) = req.into_parts();
+            let mut request = HttpRequest::from_parts(parts);
+
+            let destination = opts
+                .request_handler
+                .handle_request(src_addr, &mut request)
+                .await?;
+            // Connect to upstream and send the CONNECT request
+            let mut conn = self.connect(destination).await?;
+            request.write(&mut conn.send).await?;
+            // Read the response from upstream
+            let response = HttpResponse::read(&mut conn.recv)
+                .await
+                .map_err(ProxyError::bad_gateway)?;
+            debug!(?response, "upstream CONNECT response");
+
+            if response.status != StatusCode::OK {
+                // Forward the error response from upstream
+                return Ok(h2_error_response(response.status));
             }
-        } else {
-            request
-        };
 
-        match request {
-            HttpRequest::Forward(forward_request) => {
-                let forward = opts.as_forward()?;
-                let destination = forward.destination(&forward_request).await?;
-                let is_connect = matches!(
-                    forward_request.kind,
-                    crate::HttpProxyRequestKind::Tunnel { .. }
-                );
+            // For HTTP/1.1, use the upgrade mechanism
+            // For HTTP/2, use the body streams
+            if let Some(upgrade_fut) = upgrade {
+                // HTTP/1.1 path: after returning 200 OK, the connection is upgraded
+                // Spawn a task that waits for the upgrade and then handles bidirectional copy
+                tokio::spawn(async move {
+                    forward_upgrade(&mut conn, upgrade_fut).await;
+                });
 
-                if is_connect {
-                    // CONNECT requests need special handling for HTTP/1.1 upgrades
-                    self.handle_connect_request(destination, forward_request, body, upgrade_fut)
-                        .await
-                } else {
-                    // Non-CONNECT forward requests
-                    let mut conn = self.connect(destination).await?;
-                    HttpRequest::Forward(forward_request)
-                        .write(&mut conn.send)
-                        .await
-                        .map_err(ProxyError::io)?;
-                    tokio::spawn(async move {
-                        if let Err(err) = forward_hyper_body(body, &mut conn.send).await {
-                            warn!("failed to forward request body: {err:#}");
-                        }
-                    });
-                    read_http1_response_to_hyper(conn.recv).await
-                }
-            }
-            HttpRequest::Origin(origin_request) => {
-                let reverse = opts.as_reverse()?;
-                let destination = reverse.destination(&origin_request).await?;
-                // Convert origin-form to absolute-form for upstream forwarding
-                let absolute_request = origin_request.to_absolute(&destination);
-                let mut conn = self.connect(destination.endpoint_id).await?;
-                HttpRequest::Forward(absolute_request)
-                    .write(&mut conn.send)
-                    .await
-                    .map_err(ProxyError::io)?;
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Empty::new().map_err(infallible_to_io).boxed())
+                    .unwrap())
+            } else {
+                // HTTP/2 path: request body and response body are the bidirectional tunnel
                 tokio::spawn(async move {
                     if let Err(err) = forward_hyper_body(body, &mut conn.send).await {
-                        warn!("failed to forward request body to upstream: {err:#}");
+                        debug!("CONNECT client->upstream pipe ended: {err:#}");
                     }
                 });
-                let response = read_http1_response_to_hyper(conn.recv).await?;
-                Ok(response)
-                // let reverse = opts.as_reverse()?;
-                // let destination = reverse.destination(&origin_request).await?;
-                // let mut conn = self.create_tunnel(&destination).await?;
-                // request
-                //     .write(&mut conn.send)
-                //     .await
-                //     .map_err(ProxyError::io)?;
-                // // TODO@CODEX: Removing this line changes things, find out why
-                // conn.send.write_all(b"\r\n").await.ok();
-                // tokio::spawn(async move {
-                //     match forward_hyper_body(body, &mut conn.send).await {
-                //         Err(err) => {
-                //             warn!("failed to forward request body to upstream: {err:#}");
-                //         }
-                //         Ok(0) => {
-                //             // conn.send.write_all(b"\r\n").await.ok();
-                //         }
-                //         Ok(_n) => {}
-                //     }
-                // });
-                // read_http1_response_to_hyper(conn.recv).await
+                http1_response_to_hyper(response, conn.recv)
             }
+        } else {
+            let (parts, body) = req.into_parts();
+            let mut request = HttpRequest::from_parts(parts);
+
+            debug!(?request, "get destination for");
+            let destination = opts
+                .request_handler
+                .handle_request(src_addr, &mut request)
+                .await?;
+            debug!("destination: {destination}");
+            let mut conn = self.connect(destination).await?;
+            request.write(&mut conn.send).await?;
+            tokio::spawn(async move {
+                if let Err(err) = forward_hyper_body(body, &mut conn.send).await {
+                    warn!("failed to forward request body to upstream: {err:#}");
+                }
+            });
+            let response = read_http1_response_to_hyper(conn.recv).await?;
+            Ok(response)
+        }
+    }
+}
+
+async fn forward_upgrade(conn: &mut TunnelClientStreams, upgrade_fut: hyper::upgrade::OnUpgrade) {
+    match upgrade_fut.await {
+        Ok(upgraded) => {
+            let upgraded = TokioIo::new(upgraded);
+            // Split the upgraded connection for bidirectional copy
+            let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+            if let Err(err) = forward_bidi(
+                &mut client_read,
+                &mut client_write,
+                &mut conn.recv,
+                &mut conn.send,
+            )
+            .await
+            {
+                debug!("CONNECT bidi copy ended: {err:#}");
+            }
+        }
+        Err(err) => {
+            warn!("CONNECT upgrade failed: {err:#}");
         }
     }
 }
@@ -449,10 +330,10 @@ pub struct ProxyError {
     source: AnyError,
 }
 
-impl From<ExtractError> for ProxyError {
+impl From<Deny> for ProxyError {
     #[track_caller]
-    fn from(value: ExtractError) -> Self {
-        ProxyError::new(Some(value.response_status()), value.into())
+    fn from(value: Deny) -> Self {
+        ProxyError::new(Some(value.code), value.reason)
     }
 }
 
@@ -472,14 +353,6 @@ impl ProxyError {
     /// Returns the HTTP status code to surface to the client, if any.
     pub fn response_status(&self) -> Option<StatusCode> {
         self.response_status
-    }
-
-    fn to_response(&self) -> Option<HttpResponse> {
-        self.response_status().map(HttpResponse::new)
-    }
-
-    fn bad_request(source: impl Into<AnyError>) -> Self {
-        Self::new(Some(StatusCode::BAD_REQUEST), source.into())
     }
 
     fn gateway_timeout(source: impl Into<AnyError>) -> Self {
