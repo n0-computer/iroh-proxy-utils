@@ -18,11 +18,12 @@ const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
     header::TE,
     header::TRAILER,
     header::TRANSFER_ENCODING,
-    header::UPGRADE,
 ];
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
+
+const ALLOWED_CONNECTION_HEADERS: &[HeaderName; 1] = &[header::UPGRADE];
 
 /// Removes hop-by-hop headers from a HeaderMap per RFC 9110 Section 7.6.1.
 ///
@@ -33,13 +34,15 @@ const X_FORWARDED_HOST: &str = "x-forwarded-host";
 /// - Keep-Alive
 pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
     // First, collect any header names listed in the Connection header
-    let connection_headers: Vec<HeaderName> = headers
+    let connection_headers = headers
         .get_all(header::CONNECTION)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|s| s.split(','))
-        .filter_map(|name| name.trim().parse::<HeaderName>().ok())
-        .collect();
+        .filter_map(|name| name.trim().parse::<HeaderName>().ok());
+
+    let (connection_keep, connection_remove): (Vec<_>, Vec<_>) =
+        connection_headers.partition(|h| ALLOWED_CONNECTION_HEADERS.contains(h));
 
     // Remove the standard hop-by-hop headers
     for name in HOP_BY_HOP_HEADERS {
@@ -47,8 +50,14 @@ pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
     }
 
     // Remove any headers that were listed in the Connection header
-    for name in connection_headers {
+    for name in connection_remove {
         headers.remove(&name);
+    }
+
+    if !connection_keep.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&connection_keep.join(", ")) {
+            headers.insert(header::CONNECTION, value);
+        }
     }
 }
 

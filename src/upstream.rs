@@ -1,4 +1,5 @@
 use std::{
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -6,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use http::StatusCode;
+use http::{StatusCode, Uri, Version};
 use iroh::{
     EndpointId,
     endpoint::{Connection, ConnectionError, RecvStream, SendStream},
@@ -19,7 +20,7 @@ use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
-    HEADER_SECTION_MAX_LENGTH, HttpResponse,
+    Authority, HEADER_SECTION_MAX_LENGTH, HttpResponse,
     parse::{HttpProxyRequestKind, HttpRequest, filter_hop_by_hop_headers},
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
@@ -28,6 +29,9 @@ mod auth;
 pub use auth::*;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Supported HTTP upgrade protocols. Only these will be forwarded with upgrade support.
+const SUPPORTED_UPGRADE_PROTOCOLS: &[&str] = &["websocket"];
 
 /// Proxy that receives iroh streams and forwards them to origin servers.
 ///
@@ -181,15 +185,7 @@ impl UpstreamProxy {
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to origin server: {err:#}");
-                        HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
-                            .no_body()
-                            .write(&mut send, true)
-                            .await
-                            .inspect_err(|err| {
-                                warn!("Failed to write error response to downstream: {err:#}")
-                            })
-                            .ok();
-                        send.finish().anyerr()?;
+                        error_response_and_finish(send).await?;
                         Ok(())
                     }
                     Ok(tcp_stream) => {
@@ -208,37 +204,106 @@ impl UpstreamProxy {
                 }
             }
             HttpProxyRequestKind::Absolute { method, target } => {
-                debug!(%target, "origin request: connecting to origin");
-                let body = recv_stream_to_body(recv);
+                // Check if this is an upgrade request we should handle specially
+                let upgrade_protocol = req
+                    .headers
+                    .get(http::header::UPGRADE)
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|proto| {
+                        SUPPORTED_UPGRADE_PROTOCOLS
+                            .iter()
+                            .any(|p| p.eq_ignore_ascii_case(proto))
+                    });
 
-                // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
-                let mut headers = req.headers;
-                filter_hop_by_hop_headers(&mut headers);
+                if let Some(protocol) = upgrade_protocol {
+                    debug!(%target, %protocol, "upgrade request: connecting to origin");
+                    let mut headers = req.headers;
+                    filter_hop_by_hop_headers(&mut headers);
+                    let request = HttpRequest {
+                        version: Version::HTTP_11,
+                        headers,
+                        uri: Uri::from_str(&target).unwrap(),
+                        method,
+                    };
+                    Self::handle_upgrade_request(request, recv, send).await
+                } else {
+                    debug!(%target, "origin request: connecting to origin");
+                    let body = recv_stream_to_body(recv);
 
-                // Forward the request to the upstream server.
-                let mut response = http_client
-                    .request(method, target)
-                    .headers(headers)
-                    .body(body)
-                    .send()
-                    .await
-                    .anyerr()?;
-                filter_hop_by_hop_headers(response.headers_mut());
-                debug!(?response, "received response from origin");
-                write_response_header(&response, &mut send).await?;
-                let mut total = 0;
-                let mut body = response.bytes_stream();
-                while let Some(bytes) = body.next().await {
-                    let bytes = bytes.anyerr()?;
-                    total += bytes.len();
-                    send.write_chunk(bytes).await.anyerr()?;
+                    // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
+                    let mut headers = req.headers;
+                    filter_hop_by_hop_headers(&mut headers);
+
+                    // Forward the request to the upstream server.
+                    let mut response = match http_client
+                        .request(method, target)
+                        .headers(headers)
+                        .body(body)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => {
+                            error_response_and_finish(send).await?;
+                            return Err(err).anyerr();
+                        }
+                    };
+                    filter_hop_by_hop_headers(response.headers_mut());
+                    debug!(?response, "received response from origin");
+                    write_response_header(&response, &mut send).await?;
+                    let mut total = 0;
+                    let mut body = response.bytes_stream();
+                    while let Some(bytes) = body.next().await {
+                        let bytes = bytes.anyerr()?;
+                        total += bytes.len();
+                        send.write_chunk(bytes).await.anyerr()?;
+                    }
+                    send.finish().anyerr()?;
+                    debug!(response_body_len=%total, "finish");
+                    Ok(())
                 }
-                send.finish().anyerr()?;
-                debug!(response_body_len=%total, "finish");
-                Ok(())
             }
         }
     }
+
+    /// Handle HTTP upgrade requests (e.g., WebSocket) by connecting directly to origin.
+    ///
+    /// This bypasses reqwest since it doesn't support HTTP upgrades. We send the
+    /// request manually over TCP, and if we get 101 Switching Protocols, we pipe
+    /// the connection bidirectionally.
+    async fn handle_upgrade_request(
+        request: HttpRequest,
+        mut recv: Prebuffered<RecvStream>,
+        mut send: SendStream,
+    ) -> Result<()> {
+        let authority = Authority::from_absolute_uri(&request.uri).context("Invalid target URI")?;
+        // Connect to origin
+        let origin = match TcpStream::connect(authority.to_addr()).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!("Failed to connect to origin for upgrade: {err:#}");
+                error_response_and_finish(send).await?;
+                return Ok(());
+            }
+        };
+        let (mut origin_recv, mut origin_send) = origin.into_split();
+        request.write(&mut origin_send).await?;
+        let (to_origin, from_origin) =
+            forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send).await?;
+        debug!(to_origin, from_origin, "upgrade connection finished");
+        Ok(())
+    }
+}
+
+async fn error_response_and_finish(mut send: SendStream) -> Result<(), n0_error::AnyError> {
+    HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
+        .no_body()
+        .write(&mut send, true)
+        .await
+        .inspect_err(|err| warn!("Failed to write error response to downstream: {err:#}"))
+        .ok();
+    send.finish().anyerr()?;
+    Ok(())
 }
 
 // Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].

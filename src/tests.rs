@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::OnceLock, time::Duration};
 
 use http::StatusCode;
+use hyper_util::rt::TokioExecutor;
 use iroh::{
     Endpoint, EndpointId, discovery::static_provider::StaticProvider, endpoint::BindError,
     protocol::Router,
@@ -107,6 +108,18 @@ async fn spawn_echo_server() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
         }
     });
     Ok((addr, AbortOnDropHandle::new(task)))
+}
+
+/// Spawns an HTTP server with WebSocket support on /ws endpoint.
+async fn spawn_websocket_origin(
+    label: &'static str,
+) -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
+    let listener = TcpListener::bind("localhost:0").await?;
+    let tcp_addr = listener.local_addr()?;
+    debug!(%label, %tcp_addr, "spawned websocket origin server");
+    let task =
+        tokio::spawn(async move { origin_server::run_with_websocket(listener, label).await });
+    Ok((tcp_addr, AbortOnDropHandle::new(task)))
 }
 
 #[stack_error(derive, from_sources)]
@@ -1034,6 +1047,365 @@ async fn h2_reqwest_forward() -> Result<()> {
     Ok(())
 }
 
+// -- WebSocket tests --
+
+/// A simple executor for fastwebsockets that spawns tasks on tokio.
+struct SpawnExecutor;
+
+impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
+where
+    Fut: std::future::Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        tokio::spawn(fut);
+    }
+}
+
+/// WebSocket through HTTP/1.1 forward proxy using CONNECT tunnel.
+#[tokio::test]
+#[traced_test]
+async fn test_websocket_http1_forward_connect() -> Result {
+    use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, handshake};
+    use hyper::Request;
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_websocket_origin("wsorigin").await?;
+
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Connect and send CONNECT request manually to get raw stream
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let connect_req = format!(
+        "CONNECT {origin_addr} HTTP/1.1\r\n\
+         Host: {origin_addr}\r\n\r\n"
+    );
+    stream.write_all(connect_req.as_bytes()).await?;
+
+    // Read the 200 OK response
+    let mut buf = vec![0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "Expected 200 OK, got: {response}"
+    );
+
+    // Now perform WebSocket handshake through the tunnel
+    let req = Request::builder()
+        .method("GET")
+        .uri("/ws")
+        .header("Host", origin_addr.to_string())
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .anyerr()?;
+
+    let (ws, _) = handshake::client(&SpawnExecutor, req, stream)
+        .await
+        .anyerr()?;
+    let mut ws = FragmentCollector::new(ws);
+
+    // Send a text message
+    ws.write_frame(Frame::text(Payload::Borrowed(b"hello websocket")))
+        .await
+        .anyerr()?;
+
+    // Receive the echoed message
+    let frame = ws.read_frame().await.anyerr()?;
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(&*frame.payload, b"hello websocket");
+
+    // Send another message to verify the connection is stable
+    ws.write_frame(Frame::text(Payload::Borrowed(b"second message")))
+        .await
+        .anyerr()?;
+
+    let frame = ws.read_frame().await.anyerr()?;
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(&*frame.payload, b"second message");
+
+    // Close the WebSocket
+    ws.write_frame(Frame::close_raw(vec![].into()))
+        .await
+        .anyerr()?;
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// WebSocket through HTTP/1.1 forward proxy using absolute-form request with upgrade.
+/// This tests the upstream's ability to handle HTTP upgrade for absolute-form requests.
+#[tokio::test]
+#[traced_test]
+async fn test_websocket_http1_forward_absolute() -> Result {
+    use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, handshake};
+    use hyper::Request;
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_websocket_origin("wsorigin").await?;
+
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Connect to proxy and send absolute-form request with upgrade headers
+    let stream = TcpStream::connect(proxy_addr).await?;
+
+    // Perform WebSocket handshake using absolute-form URI
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/ws", origin_addr))
+        .header("Host", origin_addr.to_string())
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .anyerr()?;
+
+    let (ws, _) = handshake::client(&SpawnExecutor, req, stream)
+        .await
+        .anyerr()?;
+    let mut ws = FragmentCollector::new(ws);
+
+    // Send a text message
+    ws.write_frame(Frame::text(Payload::Borrowed(b"hello absolute-form ws")))
+        .await
+        .anyerr()?;
+
+    // Receive the echoed message
+    let frame = ws.read_frame().await.anyerr()?;
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(&*frame.payload, b"hello absolute-form ws");
+
+    // Send another message to verify the connection is stable
+    ws.write_frame(Frame::text(Payload::Borrowed(b"second message")))
+        .await
+        .anyerr()?;
+
+    let frame = ws.read_frame().await.anyerr()?;
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(&*frame.payload, b"second message");
+
+    // Close the WebSocket
+    ws.write_frame(Frame::close_raw(vec![].into()))
+        .await
+        .anyerr()?;
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// WebSocket through HTTP/1.1 reverse proxy (upgrade passthrough).
+///
+/// NOTE: This test is currently ignored because the proxy strips Connection/Upgrade
+/// headers as hop-by-hop headers per RFC 9110. For WebSocket upgrade passthrough to work,
+/// the proxy would need special handling to preserve these headers for upgrade requests.
+#[tokio::test]
+#[traced_test]
+async fn test_websocket_http1_reverse() -> Result {
+    use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, handshake};
+    use hyper::Request;
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_websocket_origin("wsorigin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Connect directly to the reverse proxy
+    let stream = TcpStream::connect(proxy_addr).await?;
+
+    // Perform WebSocket handshake
+    let req = Request::builder()
+        .method("GET")
+        .uri("/ws")
+        .header("Host", proxy_addr.to_string())
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .anyerr()?;
+
+    let (ws, _) = handshake::client(&SpawnExecutor, req, stream)
+        .await
+        .anyerr()?;
+    let mut ws = FragmentCollector::new(ws);
+
+    // Send and receive messages
+    ws.write_frame(Frame::text(Payload::Borrowed(b"reverse proxy ws")))
+        .await
+        .anyerr()?;
+
+    let frame = ws.read_frame().await.anyerr()?;
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(&*frame.payload, b"reverse proxy ws");
+
+    ws.write_frame(Frame::close_raw(vec![].into()))
+        .await
+        .anyerr()?;
+
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// WebSocket through HTTP/2 forward proxy using CONNECT tunnel.
+/// HTTP/2 clients establish a CONNECT tunnel first, then do HTTP/1.1 WebSocket
+/// upgrade inside the tunnel.
+///
+/// NOTE: This test is currently ignored because hyper's HTTP/2 CONNECT tunnel
+/// doesn't properly support WebSocket upgrade in the tunnel. The CONNECT
+/// succeeds but the subsequent HTTP/1.1 WebSocket handshake fails.
+/// For HTTP/2 WebSocket support, use extended CONNECT (RFC 8441) which
+/// the proxy doesn't currently support.
+#[tokio::test]
+#[traced_test]
+#[ignore = "HTTP/2 CONNECT tunnel doesn't support nested HTTP/1.1 WebSocket upgrade"]
+async fn test_websocket_h2_forward_connect() -> Result {
+    use bytes::Bytes;
+    use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, handshake};
+    use http_body_util::Empty;
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_websocket_origin("wsorigin").await?;
+
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Establish HTTP/2 connection to the proxy
+    let stream = TcpStream::connect(proxy_addr).await?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .anyerr()?;
+    let conn_task = tokio::spawn(async move { conn.await });
+
+    // Send CONNECT request to establish tunnel
+    let connect_req = Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("{origin_addr}"))
+        .body(Empty::<Bytes>::new())
+        .anyerr()?;
+
+    let res = sender.send_request(connect_req).await.anyerr()?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Get the upgraded connection (tunnel)
+    let upgraded = hyper::upgrade::on(res).await.anyerr()?;
+
+    // Perform WebSocket handshake through the HTTP/2 tunnel
+    // hyper::upgrade::Upgraded implements hyper's Read/Write, so we use TokioIo to get tokio traits
+    let req = Request::builder()
+        .method("GET")
+        .uri("/ws")
+        .header("Host", origin_addr.to_string())
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(Empty::<Bytes>::new())
+        .anyerr()?;
+
+    let (ws, _) = handshake::client(&SpawnExecutor, req, TokioIo::new(upgraded))
+        .await
+        .anyerr()?;
+    let mut ws = FragmentCollector::new(ws);
+
+    // Test WebSocket echo
+    ws.write_frame(Frame::text(Payload::Borrowed(b"h2 websocket test")))
+        .await
+        .anyerr()?;
+
+    let frame = ws.read_frame().await.anyerr()?;
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(&*frame.payload, b"h2 websocket test");
+
+    // Send multiple messages to verify stability
+    for i in 0..3 {
+        let msg = format!("message {i}");
+        ws.write_frame(Frame::text(Payload::Owned(msg.as_bytes().to_vec())))
+            .await
+            .anyerr()?;
+
+        let frame = ws.read_frame().await.anyerr()?;
+        assert_eq!(frame.opcode, OpCode::Text);
+        assert_eq!(&*frame.payload, msg.as_bytes());
+    }
+
+    ws.write_frame(Frame::close_raw(vec![].into()))
+        .await
+        .anyerr()?;
+
+    conn_task.abort();
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
+/// WebSocket through HTTP/2 reverse proxy using extended CONNECT (RFC 8441).
+///
+/// NOTE: This test is ignored because:
+/// 1. The proxy doesn't support RFC 8441 extended CONNECT for WebSockets
+/// 2. hyper's client doesn't support setting :protocol pseudo-header
+/// For now, HTTP/2 WebSocket support requires using HTTP/1.1 or a different approach.
+#[tokio::test]
+#[traced_test]
+#[ignore = "Extended CONNECT (RFC 8441) not supported by proxy or hyper client"]
+async fn test_websocket_h2_reverse() -> Result {
+    use bytes::Bytes;
+    use fastwebsockets::handshake;
+    use http_body_util::Empty;
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+
+    let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+    let (origin_addr, _origin_task) = spawn_websocket_origin("wsorigin").await?;
+
+    let destination = EndpointAuthority::new(
+        upstream_id,
+        Authority::from_authority_str(&origin_addr.to_string())?,
+    );
+    let mode = ProxyMode::Http(HttpProxyOpts::new(StaticReverseProxy(destination)));
+    let (proxy_addr, _, _proxy_task) = spawn_downstream_proxy(mode).await?;
+
+    // Establish HTTP/2 connection to the reverse proxy
+    let stream = TcpStream::connect(proxy_addr).await?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .anyerr()?;
+    let conn_task = tokio::spawn(async move { conn.await });
+
+    // Note: Extended CONNECT requires :protocol pseudo-header which hyper doesn't support
+    // This test documents that HTTP/2 WebSocket via reverse proxy isn't currently possible
+    let req = Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("/ws")
+        .header("Host", proxy_addr.to_string())
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(Empty::<Bytes>::new())
+        .anyerr()?;
+
+    let res = sender.send_request(req).await.anyerr()?;
+
+    // We expect this to fail or return an error status since extended CONNECT isn't supported
+    debug!("HTTP/2 extended CONNECT response status: {}", res.status());
+
+    conn_task.abort();
+    upstream_router.shutdown().await.anyerr()?;
+    Ok(())
+}
+
 // -- Bug exposure tests --
 
 /// BUG: Hop-by-hop headers are forwarded to upstream when they shouldn't be.
@@ -1159,8 +1531,9 @@ async fn test_response_hop_by_hop_headers_filtered() -> Result {
 mod origin_server {
     use std::{convert::Infallible, sync::Arc};
 
+    use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, WebSocketError};
     use http::HeaderValue;
-    use http_body_util::{BodyExt, Full};
+    use http_body_util::{BodyExt, Empty, Full};
     use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener;
@@ -1224,5 +1597,87 @@ mod origin_server {
                     .await;
             });
         }
+    }
+
+    /// WebSocket echo server that echoes text messages back.
+    /// Routes:
+    /// - `/ws` - WebSocket upgrade endpoint that echoes text messages
+    /// - Other paths - Returns normal HTTP response
+    pub(super) async fn run_with_websocket(listener: TcpListener, label: &'static str) {
+        let label = Arc::new(label);
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let io = TokioIo::new(stream);
+            let label = label.clone();
+            tokio::task::spawn(async move {
+                let handler = move |mut req: Request<hyper::body::Incoming>| {
+                    let label = label.clone();
+                    debug!("origin {label}: {req:?}");
+                    async move {
+                        let path = req.uri().path().to_string();
+
+                        // Check if this is a WebSocket upgrade request to /ws
+                        if path == "/ws" && fastwebsockets::upgrade::is_upgrade_request(&req) {
+                            let (response, fut) =
+                                fastwebsockets::upgrade::upgrade(&mut req).unwrap();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_websocket(fut).await {
+                                    debug!("WebSocket error: {e:?}");
+                                }
+                            });
+                            return Ok(
+                                response.map(|_| Empty::new().map_err(|e| match e {}).boxed())
+                            );
+                        }
+
+                        // Normal HTTP response
+                        let body = format!("{} {} {}", *label, req.method(), path);
+                        let len = body.len();
+                        let mut res = Response::new(
+                            Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed(),
+                        );
+                        res.headers_mut().insert(
+                            http::header::CONTENT_LENGTH,
+                            HeaderValue::from_str(&len.to_string()).unwrap(),
+                        );
+                        Ok::<_, WebSocketError>(res)
+                    }
+                };
+                let _ = http1::Builder::new()
+                    .serve_connection(io, service_fn(handler))
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    }
+
+    async fn handle_websocket(
+        fut: fastwebsockets::upgrade::UpgradeFut,
+    ) -> Result<(), WebSocketError> {
+        let ws = fut.await?;
+        let mut ws = FragmentCollector::new(ws);
+
+        loop {
+            let frame = ws.read_frame().await?;
+            match frame.opcode {
+                OpCode::Close => break,
+                OpCode::Text => {
+                    // Echo text messages back
+                    let payload = frame.payload.to_vec();
+                    ws.write_frame(Frame::text(Payload::Owned(payload))).await?;
+                }
+                OpCode::Binary => {
+                    // Echo binary messages back too
+                    let payload = frame.payload.to_vec();
+                    ws.write_frame(Frame::binary(Payload::Owned(payload)))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 }

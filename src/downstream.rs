@@ -195,9 +195,10 @@ impl DownstreamProxy {
         debug!(?request, "incoming");
 
         let is_connect = request.method() == Method::CONNECT;
+        let is_upgrade = request.headers().contains_key(http::header::UPGRADE);
 
-        // Handle upgrade for CONNECT requests over HTTP/1.
-        let upgrade = if is_connect && request.version() < http::Version::HTTP_2 {
+        // Handle upgrade for CONNECT requests or upgrade requests (e.g., WebSocket) over HTTP/1.
+        let upgrade = if (is_connect || is_upgrade) && request.version() < http::Version::HTTP_2 {
             Some(hyper::upgrade::on(&mut request))
         } else {
             None
@@ -232,13 +233,26 @@ impl DownstreamProxy {
                 spawn(forward_hyper_upgrade(upgrade_fut, conn));
                 (response, None)
             } else {
-                spawn(forward_hyper_body(body, conn.send));
+                spawn(forward_hyper_body_and_finish(body, conn.send));
+                (response, Some(conn.recv))
+            }
+        } else if let Some(upgrade_fut) = upgrade {
+            // For non-CONNECT upgrade requests (e.g., WebSocket), we need to handle
+            // the body inline because we may need to pipe bidirectionally on 101.
+            forward_hyper_body(body, &mut conn.send)
+                .await
+                .map_err(ProxyError::bad_gateway)?;
+            let response = read_response(&mut conn.recv).await?;
+
+            if response.status == StatusCode::SWITCHING_PROTOCOLS {
+                spawn(forward_hyper_upgrade(upgrade_fut, conn));
+                (response, None)
+            } else {
                 (response, Some(conn.recv))
             }
         } else {
-            // For non-CONNECT requests, we pipe the body and read the response concurrently.
-            spawn(forward_hyper_body(body, conn.send));
-            // Read the response from upstream.
+            // For regular non-CONNECT requests, pipe body and read response concurrently.
+            spawn(forward_hyper_body_and_finish(body, conn.send));
             let response = read_response(&mut conn.recv).await?;
             (response, Some(conn.recv))
         };
@@ -353,7 +367,15 @@ fn response_to_hyper(
         .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
 }
 
-async fn forward_hyper_body(mut body: Incoming, mut send: SendStream) -> Result<()> {
+async fn forward_hyper_body_and_finish(body: Incoming, mut send: SendStream) -> Result<()> {
+    forward_hyper_body(body, &mut send).await?;
+    send.finish().anyerr()?;
+    Ok(())
+}
+
+/// Forwards hyper body to send stream without finishing.
+/// Used for upgrade requests where we may need to continue using the stream.
+async fn forward_hyper_body(mut body: Incoming, send: &mut SendStream) -> Result<()> {
     while let Some(frame) = body.frame().await {
         let frame = frame.anyerr()?;
         // TODO: Add support for trailers.
@@ -361,7 +383,6 @@ async fn forward_hyper_body(mut body: Incoming, mut send: SendStream) -> Result<
             send.write_all(&data).await.anyerr()?;
         }
     }
-    send.finish().anyerr()?;
     Ok(())
 }
 
