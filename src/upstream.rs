@@ -286,8 +286,23 @@ impl UpstreamProxy {
                 return Ok(());
             }
         };
-        let (mut origin_recv, mut origin_send) = origin.into_split();
+        let (origin_recv, mut origin_send) = origin.into_split();
+
+        // Send the HTTP request to origin
         request.write(&mut origin_send).await?;
+
+        // Read and forward the response from origin (expect 101 Switching Protocols)
+        let mut origin_recv = Prebuffered::new(origin_recv, HEADER_SECTION_MAX_LENGTH);
+        let response = HttpResponse::read(&mut origin_recv).await?;
+        debug!(?response, "upgrade response from origin");
+        response.write(&mut send, true).await?;
+
+        if response.status != StatusCode::SWITCHING_PROTOCOLS {
+            send.finish().anyerr()?;
+            return Ok(());
+        }
+
+        // Pipe bidirectionally after successful upgrade
         let (to_origin, from_origin) =
             forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send).await?;
         debug!(to_origin, from_origin, "upgrade connection finished");

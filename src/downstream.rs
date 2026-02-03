@@ -1,7 +1,7 @@
 use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr};
 
 use bytes::Bytes;
-use http::{Method, StatusCode};
+use http::{Method, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
 use hyper::{
     Request, Response,
@@ -165,7 +165,8 @@ impl DownstreamProxy {
                     .http2()
                     .initial_stream_window_size(1 << 20)
                     .initial_connection_window_size(1 << 20)
-                    .max_concurrent_streams(1024);
+                    .max_concurrent_streams(1024)
+                    .enable_connect_protocol();
                 builder.serve_connection_with_upgrades(io, service).await?;
                 Ok(())
             }
@@ -195,10 +196,27 @@ impl DownstreamProxy {
         debug!(?request, "incoming");
 
         let is_connect = request.method() == Method::CONNECT;
+
+        // Handle HTTP/2 extended CONNECT (RFC 8441) - convert to upgrade-style request.
+        // Extended CONNECT uses :protocol pseudo-header instead of Upgrade header.
+        let extended_connect_protocol = request
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .map(|p| p.as_str().to_string());
+        if let Some(ref protocol) = extended_connect_protocol {
+            debug!(%protocol, "extended CONNECT request, converting to upgrade request");
+            *request.method_mut() = Method::GET;
+            request
+                .headers_mut()
+                .insert(http::header::UPGRADE, protocol.parse().unwrap());
+            request
+                .headers_mut()
+                .insert(http::header::CONNECTION, "upgrade".parse().unwrap());
+        }
+
         let is_upgrade = request.headers().contains_key(http::header::UPGRADE);
 
-        // Handle upgrade for CONNECT requests or upgrade requests (e.g., WebSocket) over HTTP/1.
-        let upgrade = if (is_connect || is_upgrade) && request.version() < http::Version::HTTP_2 {
+        let upgrade = if is_connect || is_upgrade {
             Some(hyper::upgrade::on(&mut request))
         } else {
             None
@@ -212,6 +230,12 @@ impl DownstreamProxy {
             .handle_request(src_addr, &mut request)
             .await?;
 
+        // We always forward as HTTP/1.1.
+        request.version = Version::HTTP_11;
+
+        // Now we shouldn't mutate the request anymore.
+        let request = request;
+
         debug!(destination=%destination.fmt_short(), ?request, "pipe request to upstream");
 
         // Connect to upstream.
@@ -219,23 +243,63 @@ impl DownstreamProxy {
 
         debug!("connected to upstream");
 
+        debug!(
+            is_connect,
+            extended = extended_connect_protocol.is_some(),
+            is_upgrade = upgrade.is_some(),
+            "now what?"
+        );
+
         // Forward the request header section.
         request.write(&mut conn.send).await?;
 
-        let (response, body) = if is_connect {
+        let (response, body) = if is_connect && extended_connect_protocol.is_none() {
             // For CONNECT requests, we first read the upstream response, and afterwards pipe the body.
             let response = read_response(&mut conn.recv).await?;
-            debug!(?response, "pipe response to client");
+            debug!(
+                ?response,
+                upgrade = upgrade.is_some(),
+                "read connect response"
+            );
 
-            if !response.status.is_success() {
+            if response.status != StatusCode::OK {
                 (response, None)
             } else if let Some(upgrade_fut) = upgrade {
+                debug!("connect: pipe upgrade");
                 spawn(forward_hyper_upgrade(upgrade_fut, conn));
                 (response, None)
             } else {
+                debug!("connect: pipe body");
                 spawn(forward_hyper_body_and_finish(body, conn.send));
                 (response, Some(conn.recv))
             }
+        } else if extended_connect_protocol.is_some()
+            && let Some(upgrade_fut) = upgrade
+        {
+            // HTTP/2 extended CONNECT (RFC 8441): the request/response bodies ARE the
+            // bidirectional stream. No hyper upgrade needed.
+            // spawn(forward_hyper_body_and_finish(body, conn.send));
+            let mut response = read_response(&mut conn.recv).await?;
+            debug!(?response, "read connect response");
+
+            if response.status == StatusCode::SWITCHING_PROTOCOLS {
+                // For HTTP/2, return 200 OK instead of 101 (per RFC 8441)
+                response.status = StatusCode::OK;
+                debug!("connect: pipe upgrade");
+                spawn(forward_hyper_upgrade(upgrade_fut, conn));
+                (response, None)
+            } else {
+                debug!("connect: pipe body");
+                spawn(forward_hyper_body_and_finish(body, conn.send));
+                (response, Some(conn.recv))
+            }
+            // if response.status == StatusCode::SWITCHING_PROTOCOLS {
+            //     // For HTTP/2, return 200 OK instead of 101 (per RFC 8441)
+            //     response.status = StatusCode::OK;
+            //     (response, Some(conn.recv))
+            // } else {
+            //     (response, Some(conn.recv))
+            // }
         } else if let Some(upgrade_fut) = upgrade {
             // For non-CONNECT upgrade requests (e.g., WebSocket), we need to handle
             // the body inline because we may need to pipe bidirectionally on 101.

@@ -1268,7 +1268,6 @@ async fn test_websocket_http1_reverse() -> Result {
 /// the proxy doesn't currently support.
 #[tokio::test]
 #[traced_test]
-#[ignore = "HTTP/2 CONNECT tunnel doesn't support nested HTTP/1.1 WebSocket upgrade"]
 async fn test_websocket_h2_forward_connect() -> Result {
     use bytes::Bytes;
     use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, handshake};
@@ -1353,16 +1352,12 @@ async fn test_websocket_h2_forward_connect() -> Result {
 
 /// WebSocket through HTTP/2 reverse proxy using extended CONNECT (RFC 8441).
 ///
-/// NOTE: This test is ignored because:
-/// 1. The proxy doesn't support RFC 8441 extended CONNECT for WebSockets
-/// 2. hyper's client doesn't support setting :protocol pseudo-header
-/// For now, HTTP/2 WebSocket support requires using HTTP/1.1 or a different approach.
+/// Tests HTTP/2 extended CONNECT (RFC 8441) for WebSocket via reverse proxy.
 #[tokio::test]
 #[traced_test]
-#[ignore = "Extended CONNECT (RFC 8441) not supported by proxy or hyper client"]
 async fn test_websocket_h2_reverse() -> Result {
     use bytes::Bytes;
-    use fastwebsockets::handshake;
+    use fastwebsockets::{FragmentCollector, Frame, OpCode, handshake};
     use http_body_util::Empty;
     use hyper::Request;
     use hyper_util::rt::TokioIo;
@@ -1385,21 +1380,44 @@ async fn test_websocket_h2_reverse() -> Result {
         .anyerr()?;
     let conn_task = tokio::spawn(async move { conn.await });
 
-    // Note: Extended CONNECT requires :protocol pseudo-header which hyper doesn't support
-    // This test documents that HTTP/2 WebSocket via reverse proxy isn't currently possible
+    // Build extended CONNECT request with :protocol pseudo-header
     let req = Request::builder()
         .method(http::Method::CONNECT)
-        .uri("/ws")
-        .header("Host", proxy_addr.to_string())
+        .uri(format!("http://{}/ws", proxy_addr))
         .header("Sec-WebSocket-Key", handshake::generate_key())
         .header("Sec-WebSocket-Version", "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
         .body(Empty::<Bytes>::new())
         .anyerr()?;
 
     let res = sender.send_request(req).await.anyerr()?;
-
-    // We expect this to fail or return an error status since extended CONNECT isn't supported
     debug!("HTTP/2 extended CONNECT response status: {}", res.status());
+    // Per RFC 8441, HTTP/2 extended CONNECT returns 200 OK (not 101)
+    assert_eq!(res.status(), http::StatusCode::OK);
+
+    // Upgrade to WebSocket
+    let upgraded = hyper::upgrade::on(res).await.anyerr()?;
+    debug!("client upgraded");
+    let mut ws = FragmentCollector::new(fastwebsockets::WebSocket::after_handshake(
+        TokioIo::new(upgraded),
+        fastwebsockets::Role::Client,
+    ));
+
+    // Send and receive message
+    ws.write_frame(Frame::text(fastwebsockets::Payload::Borrowed(
+        b"hello h2 extended connect",
+    )))
+    .await
+    .anyerr()?;
+    debug!("written");
+    let frame = ws.read_frame().await.anyerr()?;
+    debug!("read");
+    assert_eq!(frame.opcode, OpCode::Text);
+    assert_eq!(frame.payload.as_ref(), b"hello h2 extended connect");
+
+    ws.write_frame(Frame::close_raw(vec![].into()))
+        .await
+        .anyerr()?;
 
     conn_task.abort();
     upstream_router.shutdown().await.anyerr()?;
