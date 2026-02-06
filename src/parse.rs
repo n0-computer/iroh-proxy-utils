@@ -355,10 +355,10 @@ impl HttpRequest {
     ///
     /// Does nothing if `src_addr` is [`SrcAddr::Unix`]
     pub fn set_forwarded_for_if_tcp(&mut self, src_addr: SrcAddr) -> &mut Self {
-        if let SrcAddr::Tcp(addr) = src_addr {
-            self.set_forwarded_for(addr)
-        } else {
-            self
+        match src_addr {
+            SrcAddr::Tcp(addr) => self.set_forwarded_for(addr),
+            #[cfg(unix)]
+            SrcAddr::Unix(_) => self,
         }
     }
 

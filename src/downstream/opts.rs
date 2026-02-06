@@ -6,7 +6,6 @@ use http_body_util::BodyExt;
 use iroh::EndpointId;
 use iroh_blobs::util::connection_pool;
 use n0_error::{AnyError, Result};
-use tracing::debug;
 
 use crate::{
     downstream::{EndpointAuthority, HyperBody, SrcAddr},

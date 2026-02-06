@@ -21,7 +21,7 @@ use n0_error::{AnyError, Result, StdResultExt, anyerr, stack_error};
 use n0_future::TryStreamExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, TcpStream, UnixStream},
+    net::{TcpListener, TcpStream},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
@@ -337,14 +337,15 @@ impl SplittableStream for TcpStream {
     }
 }
 
-impl SplittableStream for UnixStream {
+#[cfg(unix)]
+impl SplittableStream for tokio::net::UnixStream {
     fn split<'a>(
         &'a mut self,
     ) -> (
         impl AsyncRead + Send + Unpin + 'a,
         impl AsyncWrite + Send + Unpin + 'a,
     ) {
-        UnixStream::split(self)
+        tokio::net::UnixStream::split(self)
     }
 }
 
