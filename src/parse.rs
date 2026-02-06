@@ -405,7 +405,7 @@ impl HttpRequest {
     }
 
     pub(crate) async fn write(
-        self,
+        &self,
         writer: &mut (impl AsyncWrite + Send + Unpin),
     ) -> io::Result<()> {
         let Self {

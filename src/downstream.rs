@@ -1,7 +1,7 @@
 use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr};
 
 use bytes::Bytes;
-use http::{Method, StatusCode, Version};
+use http::{Method, StatusCode, Version, header};
 use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
 use hyper::{
     Request, Response,
@@ -195,27 +195,9 @@ impl DownstreamProxy {
     ) -> Result<Response<HyperBody>, ProxyError> {
         debug!(?request, "incoming");
 
+        let is_upgrade = request.headers().contains_key(header::UPGRADE);
         let is_connect = request.method() == Method::CONNECT;
-
-        // Handle HTTP/2 extended CONNECT (RFC 8441) - convert to upgrade-style request.
-        // Extended CONNECT uses :protocol pseudo-header instead of Upgrade header.
-        let extended_connect_protocol = request
-            .extensions()
-            .get::<hyper::ext::Protocol>()
-            .map(|p| p.as_str().to_string());
-        if let Some(ref protocol) = extended_connect_protocol {
-            debug!(%protocol, "extended CONNECT request, converting to upgrade request");
-            *request.method_mut() = Method::GET;
-            request
-                .headers_mut()
-                .insert(http::header::UPGRADE, protocol.parse().unwrap());
-            request
-                .headers_mut()
-                .insert(http::header::CONNECTION, "upgrade".parse().unwrap());
-        }
-
-        let is_upgrade = request.headers().contains_key(http::header::UPGRADE);
-
+        let is_h2_extended_connect = convert_h2_extended_connect_to_upgrade(&mut request);
         let upgrade = if is_connect || is_upgrade {
             Some(hyper::upgrade::on(&mut request))
         } else {
@@ -245,7 +227,7 @@ impl DownstreamProxy {
 
         debug!(
             is_connect,
-            extended = extended_connect_protocol.is_some(),
+            is_h2_extended_connect,
             is_upgrade = upgrade.is_some(),
             "now what?"
         );
@@ -253,76 +235,59 @@ impl DownstreamProxy {
         // Forward the request header section.
         request.write(&mut conn.send).await?;
 
-        let (response, body) = if is_connect && extended_connect_protocol.is_none() {
-            // For CONNECT requests, we first read the upstream response, and afterwards pipe the body.
-            let response = read_response(&mut conn.recv).await?;
-            debug!(
-                ?response,
-                upgrade = upgrade.is_some(),
-                "read connect response"
-            );
-
-            if response.status != StatusCode::OK {
-                (response, None)
-            } else if let Some(upgrade_fut) = upgrade {
-                debug!("connect: pipe upgrade");
-                spawn(forward_hyper_upgrade(upgrade_fut, conn));
-                (response, None)
-            } else {
-                debug!("connect: pipe body");
-                spawn(forward_hyper_body_and_finish(body, conn.send));
-                (response, Some(conn.recv))
-            }
-        } else if extended_connect_protocol.is_some()
-            && let Some(upgrade_fut) = upgrade
-        {
-            // HTTP/2 extended CONNECT (RFC 8441): the request/response bodies ARE the
-            // bidirectional stream. No hyper upgrade needed.
-            // spawn(forward_hyper_body_and_finish(body, conn.send));
+        if let Some(upgrade_fut) = upgrade {
             let mut response = read_response(&mut conn.recv).await?;
             debug!(?response, "read connect response");
 
-            if response.status == StatusCode::SWITCHING_PROTOCOLS {
-                // For HTTP/2, return 200 OK instead of 101 (per RFC 8441)
+            if is_h2_extended_connect && response.status == StatusCode::SWITCHING_PROTOCOLS {
                 response.status = StatusCode::OK;
-                debug!("connect: pipe upgrade");
-                spawn(forward_hyper_upgrade(upgrade_fut, conn));
-                (response, None)
-            } else {
-                debug!("connect: pipe body");
-                spawn(forward_hyper_body_and_finish(body, conn.send));
-                (response, Some(conn.recv))
+                response.headers.remove(header::UPGRADE);
+                response.headers.remove(header::CONNECTION);
             }
-            // if response.status == StatusCode::SWITCHING_PROTOCOLS {
-            //     // For HTTP/2, return 200 OK instead of 101 (per RFC 8441)
-            //     response.status = StatusCode::OK;
-            //     (response, Some(conn.recv))
-            // } else {
-            //     (response, Some(conn.recv))
-            // }
-        } else if let Some(upgrade_fut) = upgrade {
-            // For non-CONNECT upgrade requests (e.g., WebSocket), we need to handle
-            // the body inline because we may need to pipe bidirectionally on 101.
-            forward_hyper_body(body, &mut conn.send)
-                .await
-                .map_err(ProxyError::bad_gateway)?;
-            let response = read_response(&mut conn.recv).await?;
 
-            if response.status == StatusCode::SWITCHING_PROTOCOLS {
+            let is_ok = is_connect && response.status == StatusCode::OK
+                || is_upgrade && response.status == StatusCode::SWITCHING_PROTOCOLS;
+
+            if is_ok {
                 spawn(forward_hyper_upgrade(upgrade_fut, conn));
-                (response, None)
+                response_to_hyper(response, None)
+            } else if request.method == Method::CONNECT {
+                response_to_hyper(response, None)
             } else {
-                (response, Some(conn.recv))
+                spawn(forward_hyper_body_and_finish(body, conn.send));
+                response_to_hyper(response, Some(conn.recv))
             }
         } else {
             // For regular non-CONNECT requests, pipe body and read response concurrently.
             spawn(forward_hyper_body_and_finish(body, conn.send));
             let response = read_response(&mut conn.recv).await?;
-            (response, Some(conn.recv))
-        };
+            response_to_hyper(response, Some(conn.recv))
+        }
+    }
+}
 
-        debug!(?response, "pipe response to client");
-        response_to_hyper(response, body)
+fn convert_h2_extended_connect_to_upgrade(request: &mut Request<Incoming>) -> bool {
+    if request.version() != Version::HTTP_2 {
+        return false;
+    }
+    // Handle HTTP/2 extended CONNECT (RFC 8441) - convert to upgrade-style request.
+    // Extended CONNECT uses :protocol pseudo-header instead of Upgrade header.
+    let extended_connect_protocol = request
+        .extensions()
+        .get::<hyper::ext::Protocol>()
+        .map(|p| p.as_str().to_string());
+    if let Some(protocol) = extended_connect_protocol {
+        debug!(%protocol, "extended CONNECT request, converting to upgrade request");
+        *request.method_mut() = Method::GET;
+        request
+            .headers_mut()
+            .insert(header::UPGRADE, protocol.parse().unwrap());
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, "upgrade".parse().unwrap());
+        true
+    } else {
+        false
     }
 }
 

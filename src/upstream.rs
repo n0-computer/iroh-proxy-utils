@@ -250,16 +250,9 @@ impl UpstreamProxy {
                     };
                     filter_hop_by_hop_headers(response.headers_mut());
                     debug!(?response, "received response from origin");
-                    write_response_header(&response, &mut send).await?;
-                    let mut total = 0;
-                    let mut body = response.bytes_stream();
-                    while let Some(bytes) = body.next().await {
-                        let bytes = bytes.anyerr()?;
-                        total += bytes.len();
-                        send.write_chunk(bytes).await.anyerr()?;
-                    }
-                    send.finish().anyerr()?;
+                    let total = forward_reqwest_response(response, &mut send).await?;
                     debug!(response_body_len=%total, "finish");
+                    send.finish().anyerr()?;
                     Ok(())
                 }
             }
@@ -310,6 +303,22 @@ impl UpstreamProxy {
     }
 }
 
+async fn forward_reqwest_response(
+    response: reqwest::Response,
+    send: &mut SendStream,
+) -> Result<usize> {
+    write_response(&response, send).await?;
+    let mut total = 0;
+    let mut body = response.bytes_stream();
+    while let Some(bytes) = body.next().await {
+        let bytes = bytes.anyerr()?;
+        total += bytes.len();
+        send.write_chunk(bytes).await.anyerr()?;
+    }
+    send.finish().anyerr()?;
+    Ok(total)
+}
+
 async fn error_response_and_finish(mut send: SendStream) -> Result<(), n0_error::AnyError> {
     HttpResponse::with_reason(StatusCode::BAD_GATEWAY, "Origin Is Unreachable")
         .no_body()
@@ -326,7 +335,7 @@ fn recv_stream_to_body(recv: Prebuffered<RecvStream>) -> reqwest::Body {
     reqwest::Body::wrap_stream(recv_to_stream(recv))
 }
 
-async fn write_response_header(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {
+async fn write_response(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {
     let status_line = format!(
         "{:?} {} {}\r\n",
         res.version(),
