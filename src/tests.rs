@@ -1559,7 +1559,7 @@ async fn spawn_downstream_proxy_uds(
     let proxy = DownstreamProxy::new(endpoint, Default::default());
 
     // Create a temp file path for the socket
-    let socket_path = std::env::temp_dir().join(format!("iroh-proxy-test-{}.sock", endpoint_id));
+    let socket_path = std::env::temp_dir().join(format!("iroh-{}.sock", endpoint_id.fmt_short()));
     // Remove if it exists from a previous run
     let _ = std::fs::remove_file(&socket_path);
 
