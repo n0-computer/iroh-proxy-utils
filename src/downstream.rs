@@ -218,19 +218,11 @@ impl DownstreamProxy {
         // Now we shouldn't mutate the request anymore.
         let request = request;
 
-        debug!(destination=%destination.fmt_short(), ?request, "pipe request to upstream");
+        debug!(destination=%destination.fmt_short(), ?request, is_connect, is_h2_extended_connect, is_upgrade, "pipe request to upstream");
 
         // Connect to upstream.
         let mut conn = self.connect(destination).await?;
-
         debug!("connected to upstream");
-
-        debug!(
-            is_connect,
-            is_h2_extended_connect,
-            is_upgrade = upgrade.is_some(),
-            "now what?"
-        );
 
         // Forward the request header section.
         request.write(&mut conn.send).await?;
