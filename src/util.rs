@@ -50,7 +50,7 @@ pub(crate) fn recv_to_stream(
         let item: io::Result<Bytes> = if let Some(init) = init.take() {
             Ok(init)
         } else {
-            match recv.read_chunk(8192, true).await {
+            match recv.read_chunk(8192).await {
                 Err(err) => Err(err.into()),
                 Ok(None) => return None,
                 Ok(Some(chunk)) => Ok(chunk.bytes),

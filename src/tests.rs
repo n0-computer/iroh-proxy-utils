@@ -3,8 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::OnceLock, t
 use http::StatusCode;
 use hyper_util::rt::TokioExecutor;
 use iroh::{
-    Endpoint, EndpointId, discovery::static_provider::StaticProvider, endpoint::BindError,
-    protocol::Router,
+    Endpoint, EndpointId, address_lookup::MemoryLookup, endpoint::BindError, protocol::Router,
 };
 use n0_error::{AnyError, Result, StdResultExt, stack_error};
 use n0_future::task::AbortOnDropHandle;
@@ -31,13 +30,13 @@ use crate::{
 // -- Test helpers --
 
 async fn bind_endpoint() -> Result<Endpoint, BindError> {
-    static STATIC_DISCOVERY: OnceLock<StaticProvider> = OnceLock::new();
-    let discovery = STATIC_DISCOVERY.get_or_init(StaticProvider::default);
+    static ADDRESS_LOOKUP: OnceLock<MemoryLookup> = OnceLock::new();
+    let address_lookup = ADDRESS_LOOKUP.get_or_init(MemoryLookup::default);
     let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
-        .discovery(discovery.clone())
+        .address_lookup(address_lookup.clone())
         .bind()
         .await?;
-    discovery.add_endpoint_info(endpoint.addr());
+    address_lookup.add_endpoint_info(endpoint.addr());
     Ok(endpoint)
 }
 
