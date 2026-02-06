@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use dynosaur::dynosaur;
 use http::{HeaderValue, Method, StatusCode, header::InvalidHeaderValue};
@@ -9,7 +9,7 @@ use n0_error::{AnyError, Result};
 use tracing::debug;
 
 use crate::{
-    downstream::{EndpointAuthority, HyperBody},
+    downstream::{EndpointAuthority, HyperBody, SrcAddr},
     parse::HttpRequest,
 };
 
@@ -140,7 +140,7 @@ pub trait RequestHandler: Send + Sync {
     /// Return [`Deny`] to reject the request with an error response.
     fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> impl Future<Output = Result<EndpointId, Deny>> + Send;
 }
@@ -157,7 +157,7 @@ pub struct StaticForwardProxy(pub EndpointId);
 impl RequestHandler for StaticForwardProxy {
     async fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         if req.method == Method::CONNECT {
@@ -174,7 +174,8 @@ impl RequestHandler for StaticForwardProxy {
                 return Err(Deny::bad_request("missing absolute-form request target"));
             }
         }
-        req.set_forwarded_for(src_addr).set_via("iroh-proxy")?;
+        req.set_forwarded_for_if_tcp(src_addr)
+            .set_via("iroh-proxy")?;
         Ok(self.0)
     }
 }
@@ -192,7 +193,7 @@ pub struct StaticReverseProxy(pub EndpointAuthority);
 impl RequestHandler for StaticReverseProxy {
     async fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         if req.method == Method::CONNECT {
@@ -207,7 +208,7 @@ impl RequestHandler for StaticReverseProxy {
                 "Absolute-form request targets are not supported",
             ));
         }
-        req.set_forwarded_for(src_addr)
+        req.set_forwarded_for_if_tcp(src_addr)
             .set_via("iroh-proxy")?
             .set_absolute_http_authority(self.0.authority.clone())
             .map_err(|err| Deny::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
@@ -241,12 +242,12 @@ impl RequestHandlerChain {
 impl RequestHandler for RequestHandlerChain {
     async fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         let mut last_err = None;
         for handler in self.0.iter() {
-            match handler.handle_request(src_addr, req).await {
+            match handler.handle_request(src_addr.clone(), req).await {
                 Ok(destination) => return Ok(destination),
                 Err(err) => {
                     last_err = Some(err);

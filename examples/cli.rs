@@ -11,7 +11,7 @@ use iroh_proxy_utils::{
     ALPN, Authority, HttpRequest, IROH_DESTINATION_HEADER,
     downstream::{
         Deny, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode, RequestHandler,
-        StaticForwardProxy, StaticReverseProxy,
+        SrcAddr, StaticForwardProxy, StaticReverseProxy,
     },
     upstream::{AcceptAll, UpstreamProxy},
 };
@@ -261,7 +261,7 @@ struct HeaderResolver;
 impl RequestHandler for HeaderResolver {
     async fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         let header = req
@@ -273,7 +273,7 @@ impl RequestHandler for HeaderResolver {
             .std_context("invalid iroh-destination header")
             .map_err(Deny::bad_request)?;
         let destination = EndpointId::from_str(header_str).map_err(Deny::bad_request)?;
-        req.set_forwarded_for(src_addr);
+        req.set_forwarded_for_if_tcp(src_addr);
         Ok(destination)
     }
 }

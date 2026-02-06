@@ -8,7 +8,7 @@ use http::{
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::util::Prebuffered;
+use crate::{downstream::SrcAddr, util::Prebuffered};
 
 /// Hop-by-hop headers that MUST NOT be forwarded by proxies per RFC 9110 Section 7.6.1.
 const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
@@ -349,6 +349,17 @@ impl HttpRequest {
             HeaderValue::from_str(&src_addr.to_string()).expect("valid header value"),
         );
         self
+    }
+
+    /// Appends an `X-Forwarded-For` header with the client address if the source is a TCP address.
+    ///
+    /// Does nothing if `src_addr` is [`SrcAddr::Unix`]
+    pub fn set_forwarded_for_if_tcp(&mut self, src_addr: SrcAddr) -> &mut Self {
+        if let SrcAddr::Tcp(addr) = src_addr {
+            self.set_forwarded_for(addr)
+        } else {
+            self
+        }
     }
 
     /// Removes the specified headers from the request.

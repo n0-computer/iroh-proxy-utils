@@ -19,7 +19,10 @@ use iroh::{
 use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
 use n0_error::{AnyError, Result, StdResultExt, anyerr, stack_error};
 use n0_future::TryStreamExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream, UnixStream},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error_span, warn};
 
@@ -99,25 +102,55 @@ impl DownstreamProxy {
         let _cancel_guard = cancel_token.clone().drop_guard();
         let mut id = 0;
         loop {
-            let (client_stream, client_addr) = listener.accept().await?;
-            let this = self.clone();
-            let mode = mode.clone();
-            tokio::spawn(
-                cancel_token
-                    .child_token()
-                    .run_until_cancelled_owned(async move {
-                        debug!(%client_addr, "accepted TCP connection");
-                        if let Err(err) = this
-                            .forward_tcp_stream(client_addr, client_stream, &mode)
-                            .await
-                        {
-                            warn!("Failed to handle TCP connection: {err:#}");
-                        }
-                    })
-                    .instrument(error_span!("tcp-accept", id)),
-            );
+            let (stream, addr) = listener.accept().await?;
+            let span = error_span!("tcp-accept", id);
+            let addr = SrcAddr::Tcp(addr);
+            self.spawn_forward_stream(addr, stream, mode.clone(), span, cancel_token.child_token());
             id += 1;
         }
+    }
+
+    /// Accepts UDS connections from the Unix Domain Socket and forwards each in a new task.
+    ///
+    /// Runs indefinitely until the listener errors or the task is cancelled.
+    #[cfg(unix)]
+    pub async fn forward_uds_listener(
+        &self,
+        listener: tokio::net::UnixListener,
+        mode: ProxyMode,
+    ) -> Result<()> {
+        let cancel_token = CancellationToken::new();
+        let _cancel_guard = cancel_token.clone().drop_guard();
+        let mut id = 0;
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            let addr = SrcAddr::Unix(addr.into());
+            let span = error_span!("uds-accept", id);
+            self.spawn_forward_stream(addr, stream, mode.clone(), span, cancel_token.child_token());
+            id += 1;
+        }
+    }
+
+    fn spawn_forward_stream(
+        &self,
+        client_addr: SrcAddr,
+        stream: impl SplittableStream,
+        mode: ProxyMode,
+        span: tracing::Span,
+        cancel_token: CancellationToken,
+    ) {
+        let this = self.clone();
+        tokio::spawn(
+            cancel_token
+                .child_token()
+                .run_until_cancelled_owned(async move {
+                    debug!(%client_addr, "accepted connection");
+                    if let Err(err) = this.forward_stream(client_addr, stream, &mode).await {
+                        warn!("Failed to handle connection: {err:#}");
+                    }
+                })
+                .instrument(span),
+        );
     }
 
     /// Forwards a single TCP stream.
@@ -126,15 +159,15 @@ impl DownstreamProxy {
     /// to the configured [`HttpProxyOpts`].
     /// For [`ProxyMode::Tcp`], this creates a CONNECT tunnel to the configured upstream and authority, and forwards the TCP
     /// stream without parsing anything.
-    async fn forward_tcp_stream(
+    async fn forward_stream(
         &self,
-        src_addr: SocketAddr,
-        mut tcp_stream: TcpStream,
+        src_addr: SrcAddr,
+        mut stream: impl SplittableStream + 'static,
         mode: &ProxyMode,
     ) -> Result<()> {
         match mode {
             ProxyMode::Tcp(destination) => {
-                let (mut tcp_recv, mut tcp_send) = tcp_stream.split();
+                let (mut tcp_recv, mut tcp_send) = stream.split();
                 let mut conn = self.create_tunnel(destination).await?;
                 debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
                 forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
@@ -143,10 +176,11 @@ impl DownstreamProxy {
                 Ok(())
             }
             ProxyMode::Http(opts) => {
-                let io = TokioIo::new(tcp_stream);
+                let io = TokioIo::new(stream);
                 let service = service_fn(|req| {
                     let this = self.clone();
                     let opts = opts.clone();
+                    let src_addr = src_addr.clone();
                     async move {
                         let res = match this.handle_hyper_request(src_addr, req, &opts).await {
                             Ok(res) => res,
@@ -189,7 +223,7 @@ impl DownstreamProxy {
 
     async fn handle_hyper_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         mut request: Request<Incoming>,
         opts: &HttpProxyOpts,
     ) -> Result<Response<HyperBody>, ProxyError> {
@@ -281,6 +315,49 @@ fn convert_h2_extended_connect_to_upgrade(request: &mut Request<Incoming>) -> bo
     } else {
         false
     }
+}
+
+trait SplittableStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
+    fn split<'a>(
+        &'a mut self,
+    ) -> (
+        impl AsyncRead + Send + Unpin + 'a,
+        impl AsyncWrite + Send + Unpin + 'a,
+    );
+}
+
+impl SplittableStream for TcpStream {
+    fn split<'a>(
+        &'a mut self,
+    ) -> (
+        impl AsyncRead + Send + Unpin + 'a,
+        impl AsyncWrite + Send + Unpin + 'a,
+    ) {
+        TcpStream::split(self)
+    }
+}
+
+impl SplittableStream for UnixStream {
+    fn split<'a>(
+        &'a mut self,
+    ) -> (
+        impl AsyncRead + Send + Unpin + 'a,
+        impl AsyncWrite + Send + Unpin + 'a,
+    ) {
+        UnixStream::split(self)
+    }
+}
+
+/// Source address for downstream client streams.
+#[derive(derive_more::From, Debug, Clone, derive_more::Display)]
+pub enum SrcAddr {
+    /// TCP source address
+    #[display("{_0}")]
+    Tcp(SocketAddr),
+    /// UDS source address
+    #[cfg(unix)]
+    #[display("Unix({_0:?})")]
+    Unix(std::os::unix::net::SocketAddr),
 }
 
 /// Bidirectional QUIC streams for an established tunnel.

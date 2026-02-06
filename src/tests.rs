@@ -21,6 +21,7 @@ use crate::{
     IROH_DESTINATION_HEADER,
     downstream::{
         Deny, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode, RequestHandler,
+        SrcAddr,
         opts::{RequestHandlerChain, StaticForwardProxy, StaticReverseProxy},
     },
     upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
@@ -190,7 +191,7 @@ struct HeaderResolver;
 impl RequestHandler for HeaderResolver {
     async fn handle_request(
         &self,
-        src_addr: SocketAddr,
+        src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         let header = req
@@ -202,7 +203,7 @@ impl RequestHandler for HeaderResolver {
             .std_context("invalid iroh-destination header")
             .map_err(Deny::bad_request)?;
         let destination = EndpointId::from_str(header_str).map_err(Deny::bad_request);
-        req.set_forwarded_for(src_addr);
+        req.set_forwarded_for_if_tcp(src_addr);
         destination
     }
 }
@@ -215,7 +216,7 @@ struct SubdomainRouter {
 impl RequestHandler for SubdomainRouter {
     async fn handle_request(
         &self,
-        _src_addr: SocketAddr,
+        _src_addr: SrcAddr,
         req: &mut HttpRequest,
     ) -> Result<EndpointId, Deny> {
         let host = req
