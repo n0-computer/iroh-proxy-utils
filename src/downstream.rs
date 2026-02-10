@@ -287,6 +287,10 @@ impl DownstreamProxy {
             // For regular non-CONNECT requests, pipe body and read response concurrently.
             spawn(forward_hyper_body_and_finish(body, conn.send));
             let response = read_response(&mut conn.recv).await?;
+            debug!(
+                status = %response.status,
+                "received response header from upstream"
+            );
             response_to_hyper(response, Some(conn.recv))
         }
     }

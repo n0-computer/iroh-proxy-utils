@@ -252,7 +252,6 @@ impl UpstreamProxy {
                     debug!(?response, "received response from origin");
                     let total = forward_reqwest_response(response, &mut send).await?;
                     debug!(response_body_len=%total, "finish");
-                    send.finish().anyerr()?;
                     Ok(())
                 }
             }
