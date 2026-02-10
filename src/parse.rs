@@ -157,6 +157,14 @@ impl Authority {
     }
 }
 
+/// Converts an absolute-form request target to origin-form (path and optional query only).
+/// Per RFC 9110, requests to an origin server use origin-form.
+pub(crate) fn absolute_target_to_origin_form(target: &str) -> Result<Uri> {
+    let uri = Uri::from_str(target).std_context("invalid target URI")?;
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    Uri::from_str(path_and_query).std_context("invalid path_and_query")
+}
+
 /// Parsed HTTP request with method, URI, headers, and version.
 ///
 /// Contains the request-line and header section of an HTTP message (RFC 9110 §6).
