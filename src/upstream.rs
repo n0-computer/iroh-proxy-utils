@@ -22,8 +22,8 @@ use tracing::{Instrument, debug, error_span, instrument, warn};
 use crate::{
     Authority, HEADER_SECTION_MAX_LENGTH, HttpResponse,
     parse::{
-        absolute_target_to_origin_form, filter_hop_by_hop_headers, HttpProxyRequestKind,
-        HttpRequest,
+        HttpProxyRequestKind, HttpRequest, absolute_target_to_origin_form,
+        filter_hop_by_hop_headers,
     },
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
