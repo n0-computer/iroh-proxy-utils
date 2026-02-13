@@ -21,7 +21,10 @@ use tracing::{Instrument, debug, error_span, instrument, warn};
 
 use crate::{
     Authority, HEADER_SECTION_MAX_LENGTH, HttpResponse,
-    parse::{HttpProxyRequestKind, HttpRequest, filter_hop_by_hop_headers},
+    parse::{
+        HttpProxyRequestKind, HttpRequest, absolute_target_to_origin_form,
+        filter_hop_by_hop_headers,
+    },
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
 
@@ -219,13 +222,17 @@ impl UpstreamProxy {
                     debug!(%target, %protocol, "upgrade request: connecting to origin");
                     let mut headers = req.headers;
                     filter_hop_by_hop_headers(&mut headers);
+                    // Request came in absolute-form over the tunnel; convert to origin-form for the origin.
+                    let target_uri = Uri::from_str(&target).std_context("invalid target URI")?;
+                    let authority = Authority::from_absolute_uri(&target_uri)?;
+                    let origin_form_uri = absolute_target_to_origin_form(&target)?;
                     let request = HttpRequest {
                         version: Version::HTTP_11,
                         headers,
-                        uri: Uri::from_str(&target).unwrap(),
+                        uri: origin_form_uri,
                         method,
                     };
-                    Self::handle_upgrade_request(request, recv, send).await
+                    Self::handle_upgrade_request(authority, request, recv, send).await
                 } else {
                     debug!(%target, "origin request: connecting to origin");
                     let body = recv_stream_to_body(recv);
@@ -262,13 +269,14 @@ impl UpstreamProxy {
     ///
     /// This bypasses reqwest since it doesn't support HTTP upgrades. We send the
     /// request manually over TCP, and if we get 101 Switching Protocols, we pipe
-    /// the connection bidirectionally.
+    /// the connection bidirectionally. The request URI should be in origin-form
+    /// (path + query only); `authority` is used for the TCP connection.
     async fn handle_upgrade_request(
+        authority: Authority,
         request: HttpRequest,
         mut recv: Prebuffered<RecvStream>,
         mut send: SendStream,
     ) -> Result<()> {
-        let authority = Authority::from_absolute_uri(&request.uri).context("Invalid target URI")?;
         // Connect to origin
         let origin = match TcpStream::connect(authority.to_addr()).await {
             Ok(stream) => stream,
