@@ -5,7 +5,7 @@ use std::{
 
 use iroh_metrics::Counter;
 
-use crate::parse::ProxyTargetId;
+use crate::Authority;
 
 /// Aggregate metrics for an [`super::UpstreamProxy`] instance.
 ///
@@ -13,7 +13,7 @@ use crate::parse::ProxyTargetId;
 /// access to per-target metrics via [`Metrics::get`] and [`Metrics::for_each`].
 #[derive(Debug, Default)]
 pub struct Metrics {
-    targets: RwLock<BTreeMap<ProxyTargetId, Arc<TargetMetrics>>>,
+    targets: RwLock<BTreeMap<Authority, Arc<TargetMetrics>>>,
     pub(super) connections_accepted: Counter,
     pub(super) connections_completed: Counter,
     pub(super) requests_accepted: Counter,
@@ -58,12 +58,12 @@ impl Metrics {
     }
 
     /// Returns the per-target metrics for `target`, if any requests have been made to it.
-    pub fn get(&self, target: &ProxyTargetId) -> Option<Arc<TargetMetrics>> {
+    pub fn get(&self, target: &Authority) -> Option<Arc<TargetMetrics>> {
         let inner = self.targets.read().expect("poisoned");
         inner.get(target).cloned()
     }
 
-    pub(super) fn get_or_insert(&self, target: ProxyTargetId) -> Arc<TargetMetrics> {
+    pub(super) fn get_or_insert(&self, target: Authority) -> Arc<TargetMetrics> {
         {
             let inner = self.targets.read().expect("poisoned");
             if let Some(value) = inner.get(&target) {
@@ -78,7 +78,7 @@ impl Metrics {
     /// Calls `f` for each tracked target and its metrics.
     ///
     /// Holds a read lock on the target map for the duration of the call.
-    pub fn for_each(&self, f: impl Fn(&ProxyTargetId, &TargetMetrics)) {
+    pub fn for_each(&self, f: impl Fn(&Authority, &TargetMetrics)) {
         let inner = self.targets.read().expect("poisoned");
         for (k, v) in inner.iter() {
             f(k, v);

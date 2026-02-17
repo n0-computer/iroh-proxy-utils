@@ -494,42 +494,15 @@ impl HttpProxyRequestKind {
     /// Returns a [`ProxyTargetId`] for this request.
     ///
     /// Returns an error if the absolute-form URI does not contain a port and does not have an HTTP(s) scheme.
-    pub fn to_id(&self) -> Result<ProxyTargetId> {
+    pub fn authority(&self) -> Result<Authority> {
         match self {
-            HttpProxyRequestKind::Tunnel { target } => Ok(ProxyTargetId {
-                kind: ProxyRequestKind::Tunnel,
-                target: target.clone(),
-            }),
+            HttpProxyRequestKind::Tunnel { target } => Ok(target.clone()),
             HttpProxyRequestKind::Absolute { target, .. } => {
                 let target = Authority::from_absolute_uri(&target)?;
-                Ok(ProxyTargetId {
-                    kind: ProxyRequestKind::Absolute,
-                    target,
-                })
+                Ok(target)
             }
         }
     }
-}
-
-/// Identifies a proxy target by its kind (tunnel or absolute) and authority.
-///
-/// Used as the key for per-target metrics tracking.
-#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone, derive_more::Display)]
-#[display("{kind}:{target}")]
-pub struct ProxyTargetId {
-    kind: ProxyRequestKind,
-    target: Authority,
-}
-
-/// Whether a proxy request is a CONNECT tunnel or an absolute-form forward.
-#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone, derive_more::Display)]
-pub enum ProxyRequestKind {
-    /// CONNECT tunnel.
-    #[display("tunnel")]
-    Tunnel,
-    /// Absolute-form HTTP forward.
-    #[display("absolute")]
-    Absolute,
 }
 
 /// HTTP request suitable for proxy routing decisions.

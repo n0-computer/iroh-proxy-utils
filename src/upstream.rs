@@ -200,7 +200,7 @@ impl UpstreamProxy {
             .try_into_proxy_request()
             .context("Received origin-form request but expected proxy request")?;
 
-        let id = req.kind.to_id()?;
+        let id = req.kind.authority()?;
         let req_metrics = metrics.get_or_insert(id);
         req_metrics.bytes_to_origin.inc_by(request_len as u64);
 
