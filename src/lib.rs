@@ -34,6 +34,7 @@ mod util;
 
 pub use parse::{
     Authority, HttpProxyRequest, HttpProxyRequestKind, HttpRequest, HttpRequestKind, HttpResponse,
+    ProxyRequestKind, ProxyTargetId,
 };
 
 /// Maximum bytes to buffer when reading HTTP header sections.
