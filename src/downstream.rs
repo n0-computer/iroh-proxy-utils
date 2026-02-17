@@ -462,7 +462,7 @@ fn response_to_hyper(
     let headers = builder.headers_mut().unwrap();
     *headers = response.headers;
     let body = match body {
-        Some(body) => StreamBody::new(recv_to_stream(body).map_ok(Frame::data)).boxed(),
+        Some(body) => StreamBody::new(recv_to_stream(body, |_| {}).map_ok(Frame::data)).boxed(),
         None => Empty::new().map_err(infallible_to_io).boxed(),
     };
     builder

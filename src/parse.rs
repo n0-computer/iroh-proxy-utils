@@ -65,7 +65,7 @@ pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
 ///
 /// Represents the authority component of a URI, containing the host (domain name
 /// or IP address) and port number. Used for routing proxy requests to origin servers.
-#[derive(Debug, Clone, derive_more::Display)]
+#[derive(Debug, Clone, derive_more::Display, Ord, PartialOrd, Hash, Eq, PartialEq)]
 #[display("{host}:{port}")]
 pub struct Authority {
     /// Hostname or IP literal (without brackets for IPv6).
@@ -159,9 +159,8 @@ impl Authority {
 
 /// Converts an absolute-form request target to origin-form (path and optional query only).
 /// Per RFC 9110, requests to an origin server use origin-form.
-pub(crate) fn absolute_target_to_origin_form(target: &str) -> Result<Uri> {
-    let uri = Uri::from_str(target).std_context("invalid target URI")?;
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+pub(crate) fn absolute_target_to_origin_form(target: &Uri) -> Result<Uri> {
+    let path_and_query = target.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     Uri::from_str(path_and_query).std_context("invalid path_and_query")
 }
 
@@ -281,9 +280,8 @@ impl HttpRequest {
                 if self.uri.scheme().is_none() || self.uri.authority().is_none() {
                     return Err(anyerr!("Missing absolute-form request target"));
                 }
-                let target = self.uri.to_string();
                 HttpProxyRequestKind::Absolute {
-                    target,
+                    target: self.uri.clone(),
                     method: self.method,
                 }
             }
@@ -476,7 +474,7 @@ pub enum HttpRequestKind {
 ///
 /// Distinguishes between CONNECT tunneling and absolute-form forwarding,
 /// both of which are valid for forward proxies.
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub enum HttpProxyRequestKind {
     /// CONNECT tunnel request with authority-form target.
     Tunnel {
@@ -486,10 +484,43 @@ pub enum HttpProxyRequestKind {
     /// Forward proxy request with absolute-form target.
     Absolute {
         /// The full target URL.
-        target: String,
+        target: Uri,
         /// The HTTP method.
         method: Method,
     },
+}
+
+impl HttpProxyRequestKind {
+    /// Returns a [`ProxyTargetId`] for this request.
+    ///
+    /// Returns an error if the absolute-form URI does not contain a port and has not an HTTP(s) scheme.
+    pub fn to_id(&self) -> Result<ProxyTargetId> {
+        match self {
+            HttpProxyRequestKind::Tunnel { target } => Ok(ProxyTargetId {
+                kind: ProxyRequestKind::Tunnel,
+                target: target.clone(),
+            }),
+            HttpProxyRequestKind::Absolute { target, .. } => {
+                let target = Authority::from_absolute_uri(&target)?;
+                Ok(ProxyTargetId {
+                    kind: ProxyRequestKind::Absolute,
+                    target,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+pub struct ProxyTargetId {
+    kind: ProxyRequestKind,
+    target: Authority,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+pub enum ProxyRequestKind {
+    Tunnel,
+    Absolute,
 }
 
 /// HTTP request suitable for proxy routing decisions.

@@ -51,8 +51,15 @@ async fn spawn_upstream_proxy_with_auth(
     auth: impl AuthHandler + 'static,
 ) -> Result<(Router, EndpointId)> {
     let endpoint = bind_endpoint().await?;
+    let upstream_proxy = UpstreamProxy::new(auth)?;
+    let metrics = upstream_proxy.metrics();
+    let on_shutdown = upstream_proxy.on_shutdown();
+    tokio::spawn(async move {
+        on_shutdown.await;
+        println!("METRICS {metrics:?}")
+    });
     let router = Router::builder(endpoint)
-        .accept(ALPN, UpstreamProxy::new(auth)?)
+        .accept(ALPN, upstream_proxy)
         .spawn();
     let endpoint_id = router.endpoint().id();
     debug!(endpoint_id=%endpoint_id.fmt_short(), "spawned upstream proxy");
@@ -265,11 +272,9 @@ impl AuthHandler for AllowAuthorities {
     ) -> Result<(), AuthError> {
         let target = match &req.kind {
             HttpProxyRequestKind::Tunnel { target } => target.to_string(),
-            HttpProxyRequestKind::Absolute { target, .. } => {
-                Authority::from_absolute_uri_str(target)
-                    .map(|a| a.to_string())
-                    .unwrap_or_default()
-            }
+            HttpProxyRequestKind::Absolute { target, .. } => Authority::from_absolute_uri(target)
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
         };
         let allowed = self.0.contains(&target);
         debug!(?allowed, ?target, list=?self.0, "AllowAuthorities::authorize");

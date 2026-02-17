@@ -1661,7 +1661,7 @@ dependencies = [
  "igd-next",
  "instant",
  "iroh-base",
- "iroh-metrics",
+ "iroh-metrics 0.37.0",
  "iroh-quinn",
  "iroh-quinn-proto",
  "iroh-quinn-udp",
@@ -1733,7 +1733,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-io",
- "iroh-metrics",
+ "iroh-metrics 0.37.0",
  "iroh-quinn",
  "iroh-tickets",
  "irpc",
@@ -1784,10 +1784,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh-metrics-derive"
-version = "0.4.0"
+name = "iroh-metrics"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4e12bd0763fd16062f5cc5e8db15dd52d26e75a8af4c7fb57ccee3589b344b8"
+checksum = "c946095f060e6e59b9ff30cc26c75cdb758e7fb0cde8312c89e2144654989fcb"
+dependencies = [
+ "iroh-metrics-derive",
+ "itoa",
+ "n0-error",
+ "postcard",
+ "ryu",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "iroh-metrics-derive"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab063c2bfd6c3d5a33a913d4fdb5252f140db29ec67c704f20f3da7e8f92dbf"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1811,6 +1826,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "iroh-blobs",
+ "iroh-metrics 0.38.2",
  "n0-error",
  "n0-future",
  "n0-tracing-test",
@@ -1895,7 +1911,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh-base",
- "iroh-metrics",
+ "iroh-metrics 0.37.0",
  "iroh-quinn",
  "iroh-quinn-proto",
  "lru",
@@ -2646,7 +2662,7 @@ dependencies = [
  "futures-util",
  "hyper-util",
  "igd-next",
- "iroh-metrics",
+ "iroh-metrics 0.37.0",
  "libc",
  "n0-error",
  "netwatch",
