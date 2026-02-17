@@ -128,6 +128,7 @@ impl UpstreamProxy {
         self.metrics.clone()
     }
 
+    /// Returns a future that resolves when this upstream proxy begins shutting down.
     pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
         self.shutdown.clone().cancelled_owned()
     }
@@ -205,10 +206,12 @@ impl UpstreamProxy {
 
         match auth.authorize(remote_id, &req).await {
             Ok(()) => {
+                metrics.requests_accepted.inc();
                 req_metrics.requests_accepted.inc();
                 debug!("request is authorized, continue");
             }
             Err(reason) => {
+                metrics.requests_denied.inc();
                 req_metrics.requests_denied.inc();
                 debug!(?reason, "request is not authorized, abort");
                 HttpResponse::new(StatusCode::FORBIDDEN)
@@ -227,6 +230,7 @@ impl UpstreamProxy {
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to origin server: {err:#}");
+                        metrics.requests_failed.inc();
                         req_metrics.requests_failed.inc();
                         error_response_and_finish(downstream_send).await?;
                         Ok(())
@@ -255,11 +259,13 @@ impl UpstreamProxy {
                         .await
                         {
                             Ok((to_origin, from_origin)) => {
+                                metrics.requests_completed.inc();
                                 req_metrics.requests_completed.inc();
                                 debug!(to_origin, from_origin, "finish");
                                 Ok(())
                             }
                             Err(err) => {
+                                metrics.requests_failed.inc();
                                 req_metrics.requests_failed.inc();
                                 Err(err)
                             }
@@ -302,10 +308,12 @@ impl UpstreamProxy {
                     .await
                     {
                         Ok(()) => {
+                            metrics.requests_completed.inc();
                             req_metrics.requests_completed.inc();
                             Ok(())
                         }
                         Err(err) => {
+                            metrics.requests_failed.inc();
                             req_metrics.requests_failed.inc();
                             Err(err)
                         }
@@ -334,6 +342,7 @@ impl UpstreamProxy {
                         Ok(response) => response,
                         Err(err) => {
                             error_response_and_finish(downstream_send).await?;
+                            metrics.requests_failed.inc();
                             req_metrics.requests_failed.inc();
                             return Err(err).anyerr();
                         }
@@ -349,10 +358,12 @@ impl UpstreamProxy {
                     match res {
                         Ok(total) => {
                             debug!(response_body_len=%total, "finish");
+                            metrics.requests_completed.inc();
                             req_metrics.requests_completed.inc();
                             Ok(())
                         }
                         Err(err) => {
+                            metrics.requests_failed.inc();
                             req_metrics.requests_failed.inc();
                             Err(err)
                         }
@@ -381,8 +392,7 @@ impl UpstreamProxy {
             Err(err) => {
                 warn!("Failed to connect to origin for upgrade: {err:#}");
                 error_response_and_finish(downstream_send).await?;
-                req_metrics.requests_failed.inc();
-                return Ok(());
+                return Err(err).anyerr();
             }
         };
         let (origin_recv, mut origin_send) = origin.into_split();

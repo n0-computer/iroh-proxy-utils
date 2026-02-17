@@ -56,7 +56,7 @@ async fn spawn_upstream_proxy_with_auth(
     let on_shutdown = upstream_proxy.on_shutdown();
     tokio::spawn(async move {
         on_shutdown.await;
-        println!("METRICS {metrics:?}")
+        debug!("metrics: {metrics:?}");
     });
     let router = Router::builder(endpoint)
         .accept(ALPN, upstream_proxy)
