@@ -36,6 +36,7 @@ use crate::{
     util::{Prebuffered, forward_bidi, recv_to_stream},
 };
 
+pub(crate) mod metrics;
 pub(crate) mod opts;
 
 /// Proxy that accepts TCP connections and forwards them over iroh.
