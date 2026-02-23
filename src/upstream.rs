@@ -1,13 +1,14 @@
 use std::{
-    str::FromStr,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
-use http::{StatusCode, Uri, Version};
+use http::{StatusCode, Version};
 use iroh::{
     EndpointId,
     endpoint::{Connection, ConnectionError, RecvStream, SendStream},
@@ -15,7 +16,10 @@ use iroh::{
 };
 use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::stream::StreamExt;
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+};
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, error_span, instrument, warn};
 
@@ -29,7 +33,9 @@ use crate::{
 };
 
 mod auth;
+mod metrics;
 pub use auth::*;
+pub use metrics::*;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -71,6 +77,7 @@ pub struct UpstreamProxy {
     shutdown: CancellationToken,
     tasks: TaskTracker,
     http_client: reqwest::Client,
+    metrics: Arc<Metrics>,
 }
 
 impl ProtocolHandler for UpstreamProxy {
@@ -80,9 +87,13 @@ impl ProtocolHandler for UpstreamProxy {
         connection: Connection,
     ) -> std::result::Result<(), iroh::protocol::AcceptError> {
         debug!(remote_id=%connection.remote_id().fmt_short(), "accepted connection");
-        self.handle_connection(connection)
+        self.metrics.connections_accepted.inc();
+        let res = self
+            .handle_connection(connection)
             .await
-            .map_err(AcceptError::from_err)
+            .map_err(AcceptError::from_err);
+        self.metrics.connections_completed.inc();
+        res
     }
 
     async fn shutdown(&self) {
@@ -108,7 +119,18 @@ impl UpstreamProxy {
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
             http_client: reqwest::Client::new(),
+            metrics: Default::default(),
         })
+    }
+
+    /// Returns the metrics tracker for this upstream proxy.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
+    /// Returns a future that resolves when this upstream proxy begins shutting down.
+    pub fn on_shutdown(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        self.shutdown.clone().cancelled_owned()
     }
 
     async fn handle_connection(&self, connection: Connection) -> Result<()> {
@@ -133,12 +155,20 @@ impl UpstreamProxy {
             let auth = self.auth.clone();
             let shutdown = self.shutdown.clone();
             let http_client = self.http_client.clone();
+            let metrics = self.metrics.clone();
             self.tasks.spawn(
                 // We don't actually shutdown the stream task. If it didn't end by the time we stop waiting at shutdown,
                 // the connection will be closed, which causes the task to finish.
                 async move {
-                    if let Err(err) =
-                        Self::handle_remote_streams(auth, remote_id, send, recv, http_client).await
+                    if let Err(err) = Self::handle_remote_streams(
+                        auth,
+                        remote_id,
+                        send,
+                        recv,
+                        http_client,
+                        metrics,
+                    )
+                    .await
                     {
                         if shutdown.is_cancelled() {
                             debug!("aborted at shutdown: {err:#}");
@@ -156,28 +186,40 @@ impl UpstreamProxy {
     async fn handle_remote_streams(
         auth: Arc<DynAuthHandler<'static>>,
         remote_id: EndpointId,
-        mut send: SendStream,
-        recv: RecvStream,
+        mut downstream_send: SendStream,
+        downstream_recv: RecvStream,
         http_client: reqwest::Client,
+        metrics: Arc<Metrics>,
     ) -> Result<()> {
-        let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
-        let req = HttpRequest::read(&mut recv).await?;
+        let mut downstream_recv = Prebuffered::new(downstream_recv, HEADER_SECTION_MAX_LENGTH);
+        let (request_len, req) = HttpRequest::peek(&mut downstream_recv).await?;
+        downstream_recv.discard(request_len);
 
         debug!(?req, "handle request");
         let req = req
             .try_into_proxy_request()
             .context("Received origin-form request but expected proxy request")?;
 
+        let id = req.kind.authority()?;
+        let req_metrics = metrics.get_or_insert(id);
+        req_metrics.bytes_to_origin.inc_by(request_len as u64);
+
         match auth.authorize(remote_id, &req).await {
-            Ok(()) => debug!("request is authorized, continue"),
+            Ok(()) => {
+                metrics.requests_accepted.inc();
+                req_metrics.requests_accepted.inc();
+                debug!("request is authorized, continue");
+            }
             Err(reason) => {
+                metrics.requests_denied.inc();
+                req_metrics.requests_denied.inc();
                 debug!(?reason, "request is not authorized, abort");
                 HttpResponse::new(StatusCode::FORBIDDEN)
                     .no_body()
-                    .write(&mut send, true)
+                    .write(&mut downstream_send, true)
                     .await
                     .ok();
-                send.finish().anyerr()?;
+                downstream_send.finish().anyerr()?;
                 return Ok(());
             }
         };
@@ -188,21 +230,46 @@ impl UpstreamProxy {
                 match TcpStream::connect(authority.to_addr()).await {
                     Err(err) => {
                         warn!("Failed to connect to origin server: {err:#}");
-                        error_response_and_finish(send).await?;
+                        metrics.requests_failed.inc();
+                        req_metrics.requests_failed.inc();
+                        error_response_and_finish(downstream_send).await?;
                         Ok(())
                     }
                     Ok(tcp_stream) => {
                         debug!(%authority, "connected to origin");
                         HttpResponse::with_reason(StatusCode::OK, "Connection Established")
-                            .write(&mut send, true)
+                            .write(&mut downstream_send, true)
                             .await
                             .context("Failed to write CONNECT response to downstream")?;
                         let (mut origin_recv, mut origin_send) = tcp_stream.into_split();
-                        let (to_origin, from_origin) =
-                            forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send)
-                                .await?;
-                        debug!(to_origin, from_origin, "finish");
-                        Ok(())
+
+                        let mut downstream_recv = TrackedRead::new(&mut downstream_recv, |d| {
+                            req_metrics.bytes_to_origin.inc_by(d);
+                        });
+                        let mut downstream_send = TrackedWrite::new(&mut downstream_send, |d| {
+                            req_metrics.bytes_from_origin.inc_by(d);
+                        });
+
+                        match forward_bidi(
+                            &mut downstream_recv,
+                            &mut downstream_send,
+                            &mut origin_recv,
+                            &mut origin_send,
+                        )
+                        .await
+                        {
+                            Ok((to_origin, from_origin)) => {
+                                metrics.requests_completed.inc();
+                                req_metrics.requests_completed.inc();
+                                debug!(to_origin, from_origin, "finish");
+                                Ok(())
+                            }
+                            Err(err) => {
+                                metrics.requests_failed.inc();
+                                req_metrics.requests_failed.inc();
+                                Err(err)
+                            }
+                        }
                     }
                 }
             }
@@ -223,8 +290,7 @@ impl UpstreamProxy {
                     let mut headers = req.headers;
                     filter_hop_by_hop_headers(&mut headers);
                     // Request came in absolute-form over the tunnel; convert to origin-form for the origin.
-                    let target_uri = Uri::from_str(&target).std_context("invalid target URI")?;
-                    let authority = Authority::from_absolute_uri(&target_uri)?;
+                    let authority = Authority::from_absolute_uri(&target)?;
                     let origin_form_uri = absolute_target_to_origin_form(&target)?;
                     let request = HttpRequest {
                         version: Version::HTTP_11,
@@ -232,10 +298,34 @@ impl UpstreamProxy {
                         uri: origin_form_uri,
                         method,
                     };
-                    Self::handle_upgrade_request(authority, request, recv, send).await
+                    match Self::handle_upgrade_request(
+                        authority,
+                        request,
+                        downstream_recv,
+                        downstream_send,
+                        req_metrics.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            metrics.requests_completed.inc();
+                            req_metrics.requests_completed.inc();
+                            Ok(())
+                        }
+                        Err(err) => {
+                            metrics.requests_failed.inc();
+                            req_metrics.requests_failed.inc();
+                            Err(err)
+                        }
+                    }
                 } else {
                     debug!(%target, "origin request: connecting to origin");
-                    let body = recv_stream_to_body(recv);
+                    let body = recv_stream_to_body(downstream_recv, {
+                        let req_metrics = req_metrics.clone();
+                        move |d| {
+                            req_metrics.bytes_to_origin.inc_by(d);
+                        }
+                    });
 
                     // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
                     let mut headers = req.headers;
@@ -243,7 +333,7 @@ impl UpstreamProxy {
 
                     // Forward the request to the upstream server.
                     let mut response = match http_client
-                        .request(method, target)
+                        .request(method, target.to_string())
                         .headers(headers)
                         .body(body)
                         .send()
@@ -251,15 +341,33 @@ impl UpstreamProxy {
                     {
                         Ok(response) => response,
                         Err(err) => {
-                            error_response_and_finish(send).await?;
+                            error_response_and_finish(downstream_send).await?;
+                            metrics.requests_failed.inc();
+                            req_metrics.requests_failed.inc();
                             return Err(err).anyerr();
                         }
                     };
                     filter_hop_by_hop_headers(response.headers_mut());
                     debug!(?response, "received response from origin");
-                    let total = forward_reqwest_response(response, &mut send).await?;
-                    debug!(response_body_len=%total, "finish");
-                    Ok(())
+                    let res = forward_reqwest_response(
+                        response,
+                        &mut downstream_send,
+                        req_metrics.clone(),
+                    )
+                    .await;
+                    match res {
+                        Ok(total) => {
+                            debug!(response_body_len=%total, "finish");
+                            metrics.requests_completed.inc();
+                            req_metrics.requests_completed.inc();
+                            Ok(())
+                        }
+                        Err(err) => {
+                            metrics.requests_failed.inc();
+                            req_metrics.requests_failed.inc();
+                            Err(err)
+                        }
+                    }
                 }
             }
         }
@@ -274,19 +382,27 @@ impl UpstreamProxy {
     async fn handle_upgrade_request(
         authority: Authority,
         request: HttpRequest,
-        mut recv: Prebuffered<RecvStream>,
-        mut send: SendStream,
+        mut downstream_recv: Prebuffered<RecvStream>,
+        mut downstream_send: SendStream,
+        req_metrics: Arc<TargetMetrics>,
     ) -> Result<()> {
         // Connect to origin
         let origin = match TcpStream::connect(authority.to_addr()).await {
             Ok(stream) => stream,
             Err(err) => {
                 warn!("Failed to connect to origin for upgrade: {err:#}");
-                error_response_and_finish(send).await?;
-                return Ok(());
+                error_response_and_finish(downstream_send).await?;
+                return Err(err).anyerr();
             }
         };
         let (origin_recv, mut origin_send) = origin.into_split();
+
+        let mut downstream_recv = TrackedRead::new(&mut downstream_recv, |d| {
+            req_metrics.bytes_to_origin.inc_by(d);
+        });
+        let mut downstream_send = TrackedWrite::new(&mut downstream_send, |d| {
+            req_metrics.bytes_from_origin.inc_by(d);
+        });
 
         // Send the HTTP request to origin
         request.write(&mut origin_send).await?;
@@ -295,16 +411,21 @@ impl UpstreamProxy {
         let mut origin_recv = Prebuffered::new(origin_recv, HEADER_SECTION_MAX_LENGTH);
         let response = HttpResponse::read(&mut origin_recv).await?;
         debug!(?response, "upgrade response from origin");
-        response.write(&mut send, true).await?;
+        response.write(&mut downstream_send, true).await?;
 
         if response.status != StatusCode::SWITCHING_PROTOCOLS {
-            send.finish().anyerr()?;
+            downstream_send.into_inner().finish().anyerr()?;
             return Ok(());
         }
 
         // Pipe bidirectionally after successful upgrade
-        let (to_origin, from_origin) =
-            forward_bidi(&mut recv, &mut send, &mut origin_recv, &mut origin_send).await?;
+        let (to_origin, from_origin) = forward_bidi(
+            &mut downstream_recv,
+            &mut downstream_send,
+            &mut origin_recv,
+            &mut origin_send,
+        )
+        .await?;
         debug!(to_origin, from_origin, "upgrade connection finished");
         Ok(())
     }
@@ -313,13 +434,19 @@ impl UpstreamProxy {
 async fn forward_reqwest_response(
     response: reqwest::Response,
     send: &mut SendStream,
+    req_metrics: Arc<TargetMetrics>,
 ) -> Result<usize> {
-    write_response(&response, send).await?;
+    let mut send = TrackedWrite::new(send, |d| {
+        req_metrics.bytes_from_origin.inc_by(d);
+    });
+    write_response(&response, &mut send).await?;
+    let send = send.into_inner();
     let mut total = 0;
     let mut body = response.bytes_stream();
     while let Some(bytes) = body.next().await {
         let bytes = bytes.anyerr()?;
         total += bytes.len();
+        req_metrics.bytes_from_origin.inc_by(bytes.len() as u64);
         send.write_chunk(bytes).await.anyerr()?;
     }
     send.finish().anyerr()?;
@@ -338,11 +465,17 @@ async fn error_response_and_finish(mut send: SendStream) -> Result<(), n0_error:
 }
 
 // Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].
-fn recv_stream_to_body(recv: Prebuffered<RecvStream>) -> reqwest::Body {
-    reqwest::Body::wrap_stream(recv_to_stream(recv))
+fn recv_stream_to_body(
+    recv: Prebuffered<RecvStream>,
+    track_data: impl Fn(u64) + Send + 'static,
+) -> reqwest::Body {
+    reqwest::Body::wrap_stream(recv_to_stream(recv, track_data))
 }
 
-async fn write_response(res: &reqwest::Response, send: &mut SendStream) -> Result<()> {
+async fn write_response(
+    res: &reqwest::Response,
+    send: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     let status_line = format!(
         "{:?} {} {}\r\n",
         res.version(),
@@ -360,4 +493,79 @@ async fn write_response(res: &reqwest::Response, send: &mut SendStream) -> Resul
     }
     send.write_all(b"\r\n").await.anyerr()?;
     Ok(())
+}
+
+struct TrackedRead<R, F> {
+    inner: R,
+    inc: F,
+}
+
+impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> TrackedRead<R, F> {
+    fn new(inner: R, inc: F) -> Self {
+        Self { inner, inc }
+    }
+}
+
+impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> AsyncRead for TrackedRead<R, F> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let this = self.get_mut();
+        let result = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf));
+        let after = buf.filled().len();
+        let diff = after - before;
+        if diff > 0 {
+            (this.inc)(diff as u64)
+        }
+        Poll::Ready(result)
+    }
+}
+
+struct TrackedWrite<W, F> {
+    inner: W,
+    inc: F,
+}
+
+impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> TrackedWrite<W, F> {
+    fn new(inner: W, inc: F) -> Self {
+        Self { inner, inc }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> AsyncWrite for TrackedWrite<W, F> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::task::ready!(Pin::new(&mut this.inner).poll_write(cx, buf));
+        if let Ok(n) = &result {
+            if *n > 0 {
+                (this.inc)(*n as u64);
+            }
+        }
+        Poll::Ready(result)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }

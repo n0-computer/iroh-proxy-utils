@@ -44,18 +44,26 @@ pub(crate) async fn forward_bidi(
 // Converts a [`Prebuffered`] recv stream into a stream of [`Bytes`].
 pub(crate) fn recv_to_stream(
     recv: Prebuffered<RecvStream>,
+    inc: impl Fn(u64),
 ) -> impl Stream<Item = io::Result<Bytes>> {
     let (init, recv) = recv.into_parts();
-    stream::unfold((Some(init), recv), async |(mut init, mut recv)| {
-        let item: io::Result<Bytes> = if let Some(init) = init.take() {
-            Ok(init)
-        } else {
-            match recv.read_chunk(8192, true).await {
-                Err(err) => Err(err.into()),
-                Ok(None) => return None,
-                Ok(Some(chunk)) => Ok(chunk.bytes),
-            }
-        };
-        Some((item, (None, recv)))
-    })
+    stream::unfold(
+        (inc, Some(init), recv),
+        async |(inc, mut init, mut recv)| {
+            let item: io::Result<Bytes> = if let Some(init) = init.take() {
+                (inc)(init.len() as u64);
+                Ok(init)
+            } else {
+                match recv.read_chunk(8192, true).await {
+                    Err(err) => Err(err.into()),
+                    Ok(None) => return None,
+                    Ok(Some(chunk)) => {
+                        (inc)(chunk.bytes.len() as u64);
+                        Ok(chunk.bytes)
+                    }
+                }
+            };
+            Some((item, (inc, None, recv)))
+        },
+    )
 }
