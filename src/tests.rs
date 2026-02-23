@@ -1,4 +1,10 @@
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use http::StatusCode;
 use hyper_util::rt::TokioExecutor;
@@ -20,8 +26,8 @@ use crate::{
     ALPN, Authority, HttpProxyRequest, HttpProxyRequestKind, HttpRequest, HttpResponse,
     IROH_DESTINATION_HEADER,
     downstream::{
-        Deny, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode, RequestHandler,
-        SrcAddr,
+        Deny, DownstreamMetrics, DownstreamProxy, EndpointAuthority, HttpProxyOpts, ProxyMode,
+        RequestHandler, SrcAddr,
         opts::{RequestHandlerChain, StaticForwardProxy, StaticReverseProxy},
     },
     upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
@@ -78,6 +84,25 @@ async fn spawn_downstream_proxy(
     debug!(endpoint_id=%endpoint_id.fmt_short(), %tcp_addr, "spawned downstream proxy");
     let task = tokio::spawn(async move { proxy.forward_tcp_listener(listener, mode).await });
     Ok((tcp_addr, endpoint_id, AbortOnDropHandle::new(task)))
+}
+
+async fn spawn_downstream_proxy_with_metrics(
+    mode: ProxyMode,
+) -> Result<(
+    SocketAddr,
+    EndpointId,
+    Arc<DownstreamMetrics>,
+    AbortOnDropHandle<Result>,
+)> {
+    let endpoint = bind_endpoint().await?;
+    let endpoint_id = endpoint.id();
+    let proxy = DownstreamProxy::new(endpoint, Default::default());
+    let metrics = proxy.metrics().clone();
+    let listener = TcpListener::bind("localhost:0").await?;
+    let tcp_addr = listener.local_addr()?;
+    debug!(endpoint_id=%endpoint_id.fmt_short(), %tcp_addr, "spawned downstream proxy");
+    let task = tokio::spawn(async move { proxy.forward_tcp_listener(listener, mode).await });
+    Ok((tcp_addr, endpoint_id, metrics, AbortOnDropHandle::new(task)))
 }
 
 /// Spawns a simple HTTP origin server that echoes back "{label} {method} {path}".
@@ -1813,6 +1838,80 @@ mod origin_server {
             }
         }
 
+        Ok(())
+    }
+}
+
+mod metrics {
+    use super::*;
+
+    struct RejectAll;
+
+    impl RequestHandler for RejectAll {
+        async fn handle_request(
+            &self,
+            _src_addr: SrcAddr,
+            _req: &mut HttpRequest,
+        ) -> Result<EndpointId, Deny> {
+            Err(Deny::bad_request("denied by RejectAll"))
+        }
+    }
+
+    #[tokio::test]
+    async fn http_metrics_track_requests() -> Result {
+        let (origin_addr, origin_task) = spawn_origin_server("metrics-origin").await?;
+        let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+        let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+        let (proxy_addr, _, metrics, proxy_task) =
+            spawn_downstream_proxy_with_metrics(mode).await?;
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+            .build()
+            .anyerr()?;
+        let res = client
+            .get(format!("http://{origin_addr}/metrics"))
+            .send()
+            .await
+            .anyerr()?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.bytes().await.anyerr()?;
+        assert_eq!(body.as_ref(), b"metrics-origin GET /metrics");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(metrics.requests_accepted.get(), 1);
+        assert_eq!(metrics.requests_accepted_h1.get(), 1);
+        assert_eq!(metrics.requests_completed.get(), 1);
+        assert_eq!(metrics.requests_denied.get(), 0);
+        assert_eq!(metrics.active_requests(), 0);
+        assert!(metrics.bytes_to_upstream.get() > 0);
+        assert!(metrics.bytes_from_upstream.get() > 0);
+        drop(origin_task);
+        drop(proxy_task);
+        upstream_router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_metrics_deny_behavior() -> Result {
+        let mode = ProxyMode::Http(HttpProxyOpts::new(RejectAll));
+        let (proxy_addr, _, metrics, proxy_task) =
+            spawn_downstream_proxy_with_metrics(mode).await?;
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
+            .build()
+            .anyerr()?;
+        let res = client
+            .get("http://example.com/denied")
+            .send()
+            .await
+            .anyerr()?;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(metrics.requests_denied.get(), 1);
+        assert_eq!(metrics.requests_completed.get(), 0);
+        assert_eq!(metrics.requests_failed.get(), 0);
+        assert_eq!(metrics.active_requests(), 0);
+
+        drop(proxy_task);
         Ok(())
     }
 }

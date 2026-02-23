@@ -1,4 +1,8 @@
-use std::io;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
 use iroh::endpoint::RecvStream;
@@ -66,4 +70,87 @@ pub(crate) fn recv_to_stream(
             Some((item, (inc, None, recv)))
         },
     )
+}
+
+/// Tracks bytes read and reports them via `inc`.
+pub(crate) struct TrackedRead<R, F> {
+    inner: R,
+    inc: F,
+}
+
+impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> TrackedRead<R, F> {
+    pub(crate) fn new(inner: R, inc: F) -> Self {
+        Self { inner, inc }
+    }
+}
+
+impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> AsyncRead for TrackedRead<R, F> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            let after = buf.filled().len();
+            let diff = after.saturating_sub(before);
+            if diff > 0 {
+                (this.inc)(diff as u64);
+            }
+        }
+        result
+    }
+}
+
+/// Tracks bytes written and reports them via `inc`.
+pub(crate) struct TrackedWrite<W, F> {
+    inner: W,
+    inc: F,
+}
+
+impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> TrackedWrite<W, F> {
+    pub(crate) fn new(inner: W, inc: F) -> Self {
+        Self { inner, inc }
+    }
+
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> AsyncWrite for TrackedWrite<W, F> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = result {
+            if n > 0 {
+                (this.inc)(n as u64);
+            }
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[macro_export]
+macro_rules! inc_by_delta {
+    ($metrics:ident, $field:tt) => {{
+        let metrics = $metrics.clone();
+        move |d| {
+            metrics.$field.inc_by(d);
+        }
+    }};
 }

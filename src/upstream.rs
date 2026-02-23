@@ -1,10 +1,8 @@
 use std::{
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    task::Poll,
     time::Duration,
 };
 
@@ -17,7 +15,7 @@ use iroh::{
 use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::stream::StreamExt;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
@@ -29,7 +27,7 @@ use crate::{
         HttpProxyRequestKind, HttpRequest, absolute_target_to_origin_form,
         filter_hop_by_hop_headers,
     },
-    util::{Prebuffered, forward_bidi, recv_to_stream},
+    util::{Prebuffered, TrackedRead, TrackedWrite, forward_bidi, recv_to_stream},
 };
 
 mod auth;
@@ -493,79 +491,4 @@ async fn write_response(
     }
     send.write_all(b"\r\n").await.anyerr()?;
     Ok(())
-}
-
-struct TrackedRead<R, F> {
-    inner: R,
-    inc: F,
-}
-
-impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> TrackedRead<R, F> {
-    fn new(inner: R, inc: F) -> Self {
-        Self { inner, inc }
-    }
-}
-
-impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> AsyncRead for TrackedRead<R, F> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let this = self.get_mut();
-        let result = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf));
-        let after = buf.filled().len();
-        let diff = after - before;
-        if diff > 0 {
-            (this.inc)(diff as u64)
-        }
-        Poll::Ready(result)
-    }
-}
-
-struct TrackedWrite<W, F> {
-    inner: W,
-    inc: F,
-}
-
-impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> TrackedWrite<W, F> {
-    fn new(inner: W, inc: F) -> Self {
-        Self { inner, inc }
-    }
-
-    fn into_inner(self) -> W {
-        self.inner
-    }
-}
-
-impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> AsyncWrite for TrackedWrite<W, F> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let result = std::task::ready!(Pin::new(&mut this.inner).poll_write(cx, buf));
-        if let Ok(n) = &result {
-            if *n > 0 {
-                (this.inc)(*n as u64);
-            }
-        }
-        Poll::Ready(result)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }
