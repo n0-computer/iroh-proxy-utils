@@ -659,6 +659,7 @@ impl HttpResponse {
     /// Removes the header section from the reader.
     pub async fn read(reader: &mut impl Prebufferable) -> Result<Self> {
         let (len, response) = Self::peek(reader).await?;
+        println!("READ RESPONSE form upsttream at downstream {len}");
         reader.discard(len);
         Ok(response)
     }

@@ -78,7 +78,7 @@ pub struct UpstreamProxy {
     shutdown: CancellationToken,
     tasks: TaskTracker,
     http_client: reqwest::Client,
-    metrics: Arc<Metrics>,
+    metrics: Arc<UpstreamMetrics>,
 }
 
 impl ProtocolHandler for UpstreamProxy {
@@ -125,7 +125,7 @@ impl UpstreamProxy {
     }
 
     /// Returns the metrics tracker for this upstream proxy.
-    pub fn metrics(&self) -> Arc<Metrics> {
+    pub fn metrics(&self) -> Arc<UpstreamMetrics> {
         self.metrics.clone()
     }
 
@@ -190,7 +190,7 @@ impl UpstreamProxy {
         mut downstream_send: SendStream,
         downstream_recv: RecvStream,
         http_client: reqwest::Client,
-        metrics: Arc<Metrics>,
+        metrics: Arc<UpstreamMetrics>,
     ) -> Result<()> {
         let mut downstream_recv = Prebuffered::new(downstream_recv, HEADER_SECTION_MAX_LENGTH);
         let (request_len, req) = HttpRequest::peek(&mut downstream_recv).await?;
@@ -441,9 +441,11 @@ async fn forward_reqwest_response(
     req_metrics: Arc<TargetMetrics>,
 ) -> Result<usize> {
     let mut send = TrackedWrite::new(send, |d| {
+        println!("TRACK HEADER {d}");
         req_metrics.bytes_from_origin.inc_by(d);
     });
     write_response(&response, &mut send).await?;
+    println!("HEADER TOTAL {}", req_metrics.bytes_from_origin.get());
     let send = send.into_inner();
     let mut total = 0;
     let mut body = response.bytes_stream();
@@ -451,6 +453,7 @@ async fn forward_reqwest_response(
         let bytes = bytes.anyerr()?;
         total += bytes.len();
         req_metrics.bytes_from_origin.inc_by(bytes.len() as u64);
+        println!("TRACK BODY {}", bytes.len());
         send.write_chunk(bytes).await.anyerr()?;
     }
     send.finish().anyerr()?;

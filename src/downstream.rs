@@ -23,7 +23,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tracing::{Instrument, debug, error_span, warn};
 
 pub use self::opts::{
@@ -35,7 +35,7 @@ use crate::{
     parse::{HttpRequest, HttpResponse},
     util::{
         Prebufferable, Prebuffered, StreamEvent, TrackedRead, TrackedStream, TrackedWrite,
-        forward_bidi, nores, recv_to_stream,
+        forward_bidi, nores,
     },
 };
 
@@ -114,14 +114,14 @@ impl DownstreamProxy {
         &self,
         destination: &EndpointAuthority,
     ) -> Result<TunnelClientStreams, ProxyError> {
-        let mut conn = self
+        let (conn, mut send, recv) = self
             .connect(destination.endpoint_id)
             .await
             .map_err(ProxyError::gateway_timeout)?;
-        conn.send
-            .write_all(destination.authority.to_connect_request().as_bytes())
+        send.write_all(destination.authority.to_connect_request().as_bytes())
             .await?;
-        let response = HttpResponse::read(&mut conn.recv)
+        let mut recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
+        let response = HttpResponse::read(&mut recv)
             .await
             .map_err(ProxyError::bad_gateway)?;
         debug!(status=%response.status, "response from upstream");
@@ -131,7 +131,7 @@ impl DownstreamProxy {
                 anyerr!("Upstream gateway returned error response"),
             ))
         } else {
-            Ok(conn)
+            Ok(TunnelClientStreams { send, recv, conn })
         }
     }
 
@@ -265,7 +265,10 @@ impl DownstreamProxy {
         }
     }
 
-    async fn connect(&self, destination: EndpointId) -> Result<TunnelClientStreams, ProxyError> {
+    async fn connect(
+        &self,
+        destination: EndpointId,
+    ) -> Result<(ConnectionRef, SendStream, RecvStream), ProxyError> {
         let conn = self
             .pool
             .get_or_connect(destination)
@@ -275,8 +278,7 @@ impl DownstreamProxy {
             .open_bi()
             .await
             .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))?;
-        let recv = Prebuffered::new(recv, HEADER_SECTION_MAX_LENGTH);
-        Ok(TunnelClientStreams { send, recv, conn })
+        Ok((conn, send, recv))
     }
 
     async fn handle_hyper_request(
@@ -341,15 +343,22 @@ impl DownstreamProxy {
         debug!(destination=%destination.fmt_short(), ?request, is_connect, is_h2_extended_connect, is_upgrade, "pipe request to upstream");
 
         // Connect to upstream.
-        let conn = self.connect(destination).await?;
-        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "connected to upstream");
+        let (conn, send, recv) = self.connect(destination).await?;
+        debug!(endpoint_id=%conn.remote_id().fmt_short(), "connected to upstream");
 
-        let TunnelClientStreams { send, recv, conn } = conn;
         let conn_guard = Arc::new(conn);
         let mut upstream_send = TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream))
             .with_guard(conn_guard.clone());
-        let mut upstream_recv = TrackedRead::new(recv, inc_by_delta!(metrics, bytes_from_upstream))
-            .with_guard(conn_guard.clone());
+        let upstream_recv = TrackedRead::new(recv, {
+            let metrics = metrics.clone();
+            move |d| {
+                println!("!! upstream recv: {d}");
+                metrics.bytes_from_upstream.inc_by(d);
+            }
+        })
+        // let mut upstream_recv = TrackedRead::new(recv, inc_by_delta!(metrics, bytes_from_upstream))
+        .with_guard(conn_guard.clone());
+        let mut upstream_recv = Prebuffered::new(upstream_recv, HEADER_SECTION_MAX_LENGTH);
 
         // Send request headers.
         request.write(&mut upstream_send).await?;
@@ -372,16 +381,15 @@ impl DownstreamProxy {
                     upgrade_fut,
                     upstream_recv,
                     upstream_send,
-                    metrics.clone(),
                 ));
-                response_to_hyper(response, None, metrics, Some(conn_guard))?
+                response_to_hyper::<tokio::io::Empty>(response, None, metrics)?
             } else if request.method == Method::CONNECT {
-                response_to_hyper(response, None, metrics, Some(conn_guard))?
+                response_to_hyper::<tokio::io::Empty>(response, None, metrics)?
             } else {
                 spawn(forward_hyper_body_and_finish(body, upstream_send));
-                // response_to_hyper tracks metrics directly.
-                let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
-                response_to_hyper(response, Some(upstream_recv), metrics, Some(conn_guard))?
+                // // response_to_hyper tracks metrics directly.
+                // let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
+                response_to_hyper(response, Some(upstream_recv), metrics)?
             }
         } else {
             spawn(forward_hyper_body_and_finish(body, upstream_send));
@@ -396,9 +404,9 @@ impl DownstreamProxy {
                 status = %response.status,
                 "received response header from upstream"
             );
-            // response_to_hyper tracks metrics directly.
-            let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
-            response_to_hyper(response, Some(upstream_recv), metrics, Some(conn_guard))?
+            // // response_to_hyper tracks metrics directly.
+            // let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
+            response_to_hyper(response, Some(upstream_recv), metrics)?
         };
 
         Ok(response)
@@ -563,20 +571,28 @@ impl ProxyError {
 
 type HyperBody = BoxBody<Bytes, io::Error>;
 
-fn response_to_hyper<G: Unpin + Send + Sync + 'static>(
+fn response_to_hyper<R>(
     response: HttpResponse,
-    body: Option<Prebuffered<RecvStream>>,
+    body: Option<R>,
     metrics: Arc<DownstreamMetrics>,
-    guard: Option<G>,
-) -> Result<Response<HyperBody>, ProxyError> {
+) -> Result<Response<HyperBody>, ProxyError>
+where
+    R: AsyncRead + Send + Sync + Unpin + 'static,
+{
     let mut builder = Response::builder().status(response.status);
     let headers = builder.headers_mut().unwrap();
     *headers = response.headers;
     let body = match body {
         Some(body) => {
-            let stream = recv_to_stream(body);
-            let stream = TrackedStream::with_guard(stream, guard, move |ev| match ev {
-                StreamEvent::Data(n) => nores(metrics.bytes_from_upstream.inc_by(n)),
+            let stream = ReaderStream::new(body);
+            // let stream = recv_to_stream(body);
+            // let stream = TrackedStream::with_guard(stream, guard, move |ev| match ev {
+            //     StreamEvent::Data(_n) => {}
+            //     StreamEvent::Done(Ok(())) => nores(metrics.requests_completed.inc()),
+            //     StreamEvent::Done(Err(_)) => nores(metrics.requests_failed.inc()),
+            // });
+            let stream = TrackedStream::new(stream, move |ev| match ev {
+                StreamEvent::Data(_n) => {}
                 StreamEvent::Done(Ok(())) => nores(metrics.requests_completed.inc()),
                 StreamEvent::Done(Err(_)) => nores(metrics.requests_failed.inc()),
             });
@@ -621,18 +637,11 @@ async fn forward_hyper_upgrade(
     upgrade_fut: hyper::upgrade::OnUpgrade,
     mut upstream_recv: impl AsyncRead + Send + Unpin,
     mut upstream_send: impl AsyncWrite + Send + Unpin,
-    metrics: Arc<DownstreamMetrics>,
 ) -> Result<()> {
     let upgraded = upgrade_fut.await.std_context("HTTP/1 upgrade failed")?;
     let upgraded = TokioIo::new(upgraded);
     // Split the upgraded connection for bidirectional copy
-    let (client_read, client_write) = tokio::io::split(upgraded);
-
-    let mut client_read = TrackedRead::new(client_read, inc_by_delta!(metrics, bytes_to_upstream));
-    let mut client_write = TrackedWrite::new(client_write, {
-        inc_by_delta!(metrics, bytes_from_upstream)
-    });
-
+    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
     forward_bidi(
         &mut client_read,
         &mut client_write,

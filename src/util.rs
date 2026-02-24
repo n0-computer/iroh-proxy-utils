@@ -69,15 +69,13 @@ pub(crate) fn recv_to_stream(
 
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
-pub struct TrackedStream<S, F, G = ()>
+pub struct TrackedStream<S, F>
 where
     F: for<'a> Fn(StreamEvent<'a>) + Unpin + Send + 'static,
-    G: Unpin + Send + 'static,
 {
     #[pin]
     inner: S,
     on_event: Option<F>,
-    _guard: Option<G>,
 }
 
 #[derive(Debug)]
@@ -95,30 +93,14 @@ where
         Self {
             inner,
             on_event: Some(on_event),
-            _guard: None,
-        }
-    }
-}
-
-impl<S, F, G> TrackedStream<S, F, G>
-where
-    F: for<'a> Fn(StreamEvent<'a>) + Unpin + Send + 'static,
-    G: Unpin + Send + 'static,
-{
-    pub fn with_guard(inner: S, guard: Option<G>, on_event: F) -> Self {
-        Self {
-            inner,
-            on_event: Some(on_event),
-            _guard: guard,
         }
     }
 }
 
 #[pinned_drop]
-impl<S, F, G> PinnedDrop for TrackedStream<S, F, G>
+impl<S, F> PinnedDrop for TrackedStream<S, F>
 where
     F: for<'a> Fn(StreamEvent<'a>) + Unpin + Send + 'static,
-    G: Unpin + Send + 'static,
 {
     fn drop(self: Pin<&mut Self>) {
         if let Some(f) = self.project().on_event.take() {
@@ -127,11 +109,10 @@ where
     }
 }
 
-impl<S, F, G> Stream for TrackedStream<S, F, G>
+impl<S, F> Stream for TrackedStream<S, F>
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send,
     F: for<'a> Fn(StreamEvent<'a>) + Unpin + Send + 'static,
-    G: Unpin + Send + 'static,
 {
     type Item = S::Item;
 
@@ -179,9 +160,9 @@ impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> TrackedRead<R, F> {
 }
 
 impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin, G: Unpin> TrackedRead<R, F, G> {
-    pub(crate) fn into_parts(self) -> (R, F) {
-        (self.inner, self.inc)
-    }
+    // pub(crate) fn into_parts(self) -> (R, F) {
+    //     (self.inner, self.inc)
+    // }
 
     pub(crate) fn with_guard<GG>(self, guard: GG) -> TrackedRead<R, F, GG> {
         TrackedRead {
@@ -210,6 +191,7 @@ impl<R: AsyncRead + Unpin + Send, F: Fn(u64) + Unpin + Send, G: Unpin + Send> Pr
     async fn buffer_more(&mut self) -> tokio::io::Result<usize> {
         match self.inner.buffer_more().await {
             Ok(n) => {
+                println!("INC from bm {n}");
                 (self.inc)(n as u64);
                 Ok(n)
             }
@@ -231,6 +213,7 @@ impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin, G: Unpin> AsyncRead for TrackedRe
             let after = buf.filled().len();
             let diff = after.saturating_sub(before);
             if diff > 0 {
+                println!("INC from ar {diff}");
                 (this.inc)(diff as u64);
             }
         }

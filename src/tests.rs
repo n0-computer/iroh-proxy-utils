@@ -30,7 +30,7 @@ use crate::{
         RequestHandler, SrcAddr,
         opts::{RequestHandlerChain, StaticForwardProxy, StaticReverseProxy},
     },
-    upstream::{AcceptAll, AuthError, AuthHandler, UpstreamProxy},
+    upstream::{AcceptAll, AuthError, AuthHandler, UpstreamMetrics, UpstreamProxy},
     util::Prebuffered,
 };
 
@@ -49,27 +49,27 @@ async fn bind_endpoint() -> Result<Endpoint, BindError> {
 
 /// Spawns an upstream iroh proxy that accepts all requests.
 async fn spawn_upstream_proxy() -> Result<(Router, EndpointId)> {
+    let (router, id, _metrics) = spawn_upstream_proxy_with_auth(AcceptAll).await?;
+    Ok((router, id))
+}
+
+async fn spawn_upstream_proxy_with_metrics() -> Result<(Router, EndpointId, Arc<UpstreamMetrics>)> {
     spawn_upstream_proxy_with_auth(AcceptAll).await
 }
 
 /// Spawns an upstream iroh proxy with a custom auth handler.
 async fn spawn_upstream_proxy_with_auth(
     auth: impl AuthHandler + 'static,
-) -> Result<(Router, EndpointId)> {
+) -> Result<(Router, EndpointId, Arc<UpstreamMetrics>)> {
     let endpoint = bind_endpoint().await?;
     let upstream_proxy = UpstreamProxy::new(auth)?;
     let metrics = upstream_proxy.metrics();
-    let on_shutdown = upstream_proxy.on_shutdown();
-    tokio::spawn(async move {
-        on_shutdown.await;
-        debug!("metrics: {metrics:?}");
-    });
     let router = Router::builder(endpoint)
         .accept(ALPN, upstream_proxy)
         .spawn();
     let endpoint_id = router.endpoint().id();
     debug!(endpoint_id=%endpoint_id.fmt_short(), "spawned upstream proxy");
-    Ok((router, endpoint_id))
+    Ok((router, endpoint_id, metrics))
 }
 
 /// Spawns a downstream proxy with given mode and returns (addr, endpoint_id, task).
@@ -578,7 +578,7 @@ async fn test_upstream_auth_endpoint() -> Result {
     let (proxy_addr, downstream_id, proxy_task) = spawn_downstream_proxy(mode_placeholder).await?;
 
     // Upstream that only allows this specific downstream
-    let (upstream_router, upstream_id) =
+    let (upstream_router, upstream_id, _metrics) =
         spawn_upstream_proxy_with_auth(AllowEndpoints(vec![downstream_id])).await?;
 
     // Authorized request should succeed
@@ -630,7 +630,7 @@ async fn test_upstream_auth_authority() -> Result {
     let (denied_addr, _denied_task) = spawn_origin_server("denied").await?;
 
     // Upstream that only allows connections to allowed_addr
-    let (upstream_router, upstream_id) =
+    let (upstream_router, upstream_id, _metrics) =
         spawn_upstream_proxy_with_auth(AllowAuthorities(vec![allowed_addr.to_string()])).await?;
 
     // Downstream forward proxy using CONNECT
@@ -1867,9 +1867,10 @@ mod metrics {
     #[traced_test]
     async fn http_metrics_track_requests() -> Result {
         let (origin_addr, origin_task) = spawn_origin_server_echo_body("origin").await?;
-        let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
+        let (upstream_router, upstream_id, upstream_metrics) =
+            spawn_upstream_proxy_with_metrics().await?;
         let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
-        let (proxy_addr, _, metrics, proxy_task) =
+        let (proxy_addr, _, downstream_metrics, proxy_task) =
             spawn_downstream_proxy_with_metrics(mode).await?;
         let client = reqwest::Client::builder()
             .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
@@ -1881,11 +1882,11 @@ mod metrics {
         // we spawn a separate task to ensure active_requests is 1 if the body is not yet terminated.
         // need to do this in a task to not deadlock, because post.send().await waits for the response.
         let body_task = tokio::task::spawn({
-            let metrics = metrics.clone();
+            let downstream_metrics = downstream_metrics.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 tx.send(Ok(Bytes::from("hello"))).await.unwrap();
-                assert_eq!(metrics.active_requests(), 1);
+                assert_eq!(downstream_metrics.active_requests(), 1);
                 drop(tx);
             }
         });
@@ -1899,22 +1900,37 @@ mod metrics {
         assert_eq!(res.status(), StatusCode::OK);
         let body = res.bytes().await.anyerr()?;
         assert_eq!(body.as_ref(), b"origin POST /upload: hello");
-        assert_eq!(metrics.active_requests(), 0);
-        assert_eq!(metrics.requests_accepted.get(), 1);
-        assert_eq!(metrics.requests_accepted_h1.get(), 1);
-        assert_eq!(metrics.requests_completed.get(), 1);
-        assert_eq!(metrics.requests_denied.get(), 0);
-        assert!(metrics.bytes_to_upstream.get() > 0);
-        assert!(metrics.bytes_from_upstream.get() > 0);
-        assert_eq!(metrics.iroh_connections_opened.get(), 1);
-        assert_eq!(metrics.iroh_connections_closed_error.get(), 0);
-        assert_eq!(metrics.iroh_connections_closed_idle.get(), 0);
-        assert_eq!(metrics.active_iroh_connections(), 1);
+        assert_eq!(downstream_metrics.active_requests(), 0);
+        assert_eq!(downstream_metrics.requests_accepted.get(), 1);
+        assert_eq!(downstream_metrics.requests_accepted_h1.get(), 1);
+        assert_eq!(downstream_metrics.requests_completed.get(), 1);
+        assert_eq!(downstream_metrics.requests_denied.get(), 0);
+        assert!(downstream_metrics.bytes_to_upstream.get() > 0);
+        assert!(downstream_metrics.bytes_from_upstream.get() > 0);
+        assert_eq!(downstream_metrics.iroh_connections_opened.get(), 1);
+        assert_eq!(downstream_metrics.iroh_connections_closed_error.get(), 0);
+        assert_eq!(downstream_metrics.iroh_connections_closed_idle.get(), 0);
+        assert_eq!(downstream_metrics.active_iroh_connections(), 1);
         drop(origin_task);
         drop(proxy_task);
         upstream_router.shutdown().await.anyerr()?;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(metrics.iroh_connections_closed_error.get(), 1);
+        assert_eq!(downstream_metrics.iroh_connections_closed_error.get(), 1);
+
+        let origin_metrics = upstream_metrics
+            .get(&Authority::from_authority_str(&origin_addr.to_string()).unwrap())
+            .expect("exists");
+
+        assert_eq!(
+            origin_metrics.bytes_from_origin(),
+            downstream_metrics.bytes_from_upstream.get()
+        );
+        assert_eq!(
+            origin_metrics.bytes_to_origin(),
+            downstream_metrics.bytes_to_upstream.get()
+        );
+
+        debug!("downstream metrics: {downstream_metrics:#?}");
         Ok(())
     }
 
