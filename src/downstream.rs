@@ -352,7 +352,6 @@ impl DownstreamProxy {
         let upstream_recv = TrackedRead::new(recv, {
             let metrics = metrics.clone();
             move |d| {
-                println!("!! upstream recv: {d}");
                 metrics.bytes_from_upstream.inc_by(d);
             }
         })

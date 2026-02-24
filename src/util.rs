@@ -191,7 +191,6 @@ impl<R: AsyncRead + Unpin + Send, F: Fn(u64) + Unpin + Send, G: Unpin + Send> Pr
     async fn buffer_more(&mut self) -> tokio::io::Result<usize> {
         match self.inner.buffer_more().await {
             Ok(n) => {
-                println!("INC from bm {n}");
                 (self.inc)(n as u64);
                 Ok(n)
             }
@@ -213,7 +212,6 @@ impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin, G: Unpin> AsyncRead for TrackedRe
             let after = buf.filled().len();
             let diff = after.saturating_sub(before);
             if diff > 0 {
-                println!("INC from ar {diff}");
                 (this.inc)(diff as u64);
             }
         }

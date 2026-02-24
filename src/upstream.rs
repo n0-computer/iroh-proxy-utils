@@ -441,11 +441,9 @@ async fn forward_reqwest_response(
     req_metrics: Arc<TargetMetrics>,
 ) -> Result<usize> {
     let mut send = TrackedWrite::new(send, |d| {
-        println!("TRACK HEADER {d}");
         req_metrics.bytes_from_origin.inc_by(d);
     });
     write_response(&response, &mut send).await?;
-    println!("HEADER TOTAL {}", req_metrics.bytes_from_origin.get());
     let send = send.into_inner();
     let mut total = 0;
     let mut body = response.bytes_stream();
@@ -453,7 +451,6 @@ async fn forward_reqwest_response(
         let bytes = bytes.anyerr()?;
         total += bytes.len();
         req_metrics.bytes_from_origin.inc_by(bytes.len() as u64);
-        println!("TRACK BODY {}", bytes.len());
         send.write_chunk(bytes).await.anyerr()?;
     }
     send.finish().anyerr()?;

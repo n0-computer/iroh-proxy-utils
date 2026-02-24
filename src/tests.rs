@@ -612,7 +612,6 @@ async fn test_upstream_auth_endpoint() -> Result {
     // Should fail (error status or connection closed)
     let (status, body) = read_http_response(&mut stream2).await?;
     assert_eq!(status, 403);
-    println!("BODY {}", String::from_utf8_lossy(&body));
     assert!(body.is_empty());
 
     drop(proxy_task);
@@ -1748,10 +1747,8 @@ mod origin_server {
                     async move {
                         let method = req.method().clone();
                         let path = req.uri().path().to_string();
-                        println!("RECEIVED {path}");
                         let body_bytes = req.collect().await.unwrap().to_bytes();
                         let body_str = String::from_utf8_lossy(&body_bytes);
-                        println!("RECEIVED BODY {body_str}");
                         let response = format!("{} {} {}: {}", *label, method, path, body_str);
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response))))
                     }
