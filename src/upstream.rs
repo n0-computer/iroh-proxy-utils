@@ -1,10 +1,8 @@
 use std::{
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    task::Poll,
     time::Duration,
 };
 
@@ -17,7 +15,7 @@ use iroh::{
 use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::stream::StreamExt;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
@@ -29,7 +27,10 @@ use crate::{
         HttpProxyRequestKind, HttpRequest, absolute_target_to_origin_form,
         filter_hop_by_hop_headers,
     },
-    util::{Prebuffered, forward_bidi, recv_to_stream},
+    util::{
+        Prebuffered, StreamEvent, TrackedRead, TrackedStream, TrackedWrite, forward_bidi, nores,
+        recv_to_stream,
+    },
 };
 
 mod auth;
@@ -77,7 +78,7 @@ pub struct UpstreamProxy {
     shutdown: CancellationToken,
     tasks: TaskTracker,
     http_client: reqwest::Client,
-    metrics: Arc<Metrics>,
+    metrics: Arc<UpstreamMetrics>,
 }
 
 impl ProtocolHandler for UpstreamProxy {
@@ -124,7 +125,7 @@ impl UpstreamProxy {
     }
 
     /// Returns the metrics tracker for this upstream proxy.
-    pub fn metrics(&self) -> Arc<Metrics> {
+    pub fn metrics(&self) -> Arc<UpstreamMetrics> {
         self.metrics.clone()
     }
 
@@ -189,7 +190,7 @@ impl UpstreamProxy {
         mut downstream_send: SendStream,
         downstream_recv: RecvStream,
         http_client: reqwest::Client,
-        metrics: Arc<Metrics>,
+        metrics: Arc<UpstreamMetrics>,
     ) -> Result<()> {
         let mut downstream_recv = Prebuffered::new(downstream_recv, HEADER_SECTION_MAX_LENGTH);
         let (request_len, req) = HttpRequest::peek(&mut downstream_recv).await?;
@@ -320,12 +321,15 @@ impl UpstreamProxy {
                     }
                 } else {
                     debug!(%target, "origin request: connecting to origin");
-                    let body = recv_stream_to_body(downstream_recv, {
+                    let body = {
                         let req_metrics = req_metrics.clone();
-                        move |d| {
-                            req_metrics.bytes_to_origin.inc_by(d);
-                        }
-                    });
+                        let body = recv_to_stream(downstream_recv);
+                        let body = TrackedStream::new(body, move |ev| match ev {
+                            StreamEvent::Data(n) => nores(req_metrics.bytes_to_origin.inc_by(n)),
+                            _ => {}
+                        });
+                        reqwest::Body::wrap_stream(body)
+                    };
 
                     // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
                     let mut headers = req.headers;
@@ -464,14 +468,6 @@ async fn error_response_and_finish(mut send: SendStream) -> Result<(), n0_error:
     Ok(())
 }
 
-// Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].
-fn recv_stream_to_body(
-    recv: Prebuffered<RecvStream>,
-    track_data: impl Fn(u64) + Send + 'static,
-) -> reqwest::Body {
-    reqwest::Body::wrap_stream(recv_to_stream(recv, track_data))
-}
-
 async fn write_response(
     res: &reqwest::Response,
     send: &mut (impl AsyncWrite + Unpin),
@@ -493,79 +489,4 @@ async fn write_response(
     }
     send.write_all(b"\r\n").await.anyerr()?;
     Ok(())
-}
-
-struct TrackedRead<R, F> {
-    inner: R,
-    inc: F,
-}
-
-impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> TrackedRead<R, F> {
-    fn new(inner: R, inc: F) -> Self {
-        Self { inner, inc }
-    }
-}
-
-impl<R: AsyncRead + Unpin, F: Fn(u64) + Unpin> AsyncRead for TrackedRead<R, F> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let this = self.get_mut();
-        let result = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf));
-        let after = buf.filled().len();
-        let diff = after - before;
-        if diff > 0 {
-            (this.inc)(diff as u64)
-        }
-        Poll::Ready(result)
-    }
-}
-
-struct TrackedWrite<W, F> {
-    inner: W,
-    inc: F,
-}
-
-impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> TrackedWrite<W, F> {
-    fn new(inner: W, inc: F) -> Self {
-        Self { inner, inc }
-    }
-
-    fn into_inner(self) -> W {
-        self.inner
-    }
-}
-
-impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin> AsyncWrite for TrackedWrite<W, F> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let result = std::task::ready!(Pin::new(&mut this.inner).poll_write(cx, buf));
-        if let Ok(n) = &result {
-            if *n > 0 {
-                (this.inc)(*n as u64);
-            }
-        }
-        Poll::Ready(result)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }

@@ -12,7 +12,7 @@ use crate::Authority;
 /// Tracks connection and request counts across all targets, and provides
 /// access to per-target metrics via [`Metrics::get`] and [`Metrics::for_each`].
 #[derive(Debug, Default)]
-pub struct Metrics {
+pub struct UpstreamMetrics {
     targets: RwLock<BTreeMap<Authority, Arc<TargetMetrics>>>,
     pub(super) connections_accepted: Counter,
     pub(super) connections_completed: Counter,
@@ -22,7 +22,7 @@ pub struct Metrics {
     pub(super) requests_failed: Counter,
 }
 
-impl Metrics {
+impl UpstreamMetrics {
     /// Returns the total number of denied requests across all targets.
     pub fn denied_requests(&self) -> u64 {
         self.requests_denied.get()
