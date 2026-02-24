@@ -188,7 +188,9 @@ async fn create_http_connect_tunnel(
 }
 
 /// Reads HTTP response and returns (status_code, body).
-async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<(u16, Vec<u8>)> {
+async fn read_http_response(
+    stream: &mut (impl AsyncRead + Unpin + Send),
+) -> Result<(u16, Vec<u8>)> {
     let mut prebuf = Prebuffered::new(stream, 8192);
     let response = HttpResponse::read(&mut prebuf)
         .timeout(Duration::from_secs(3))
@@ -1746,8 +1748,10 @@ mod origin_server {
                     async move {
                         let method = req.method().clone();
                         let path = req.uri().path().to_string();
+                        println!("RECEIVED {path}");
                         let body_bytes = req.collect().await.unwrap().to_bytes();
                         let body_str = String::from_utf8_lossy(&body_bytes);
+                        println!("RECEIVED BODY {body_str}");
                         let response = format!("{} {} {}: {}", *label, method, path, body_str);
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response))))
                     }
@@ -1843,6 +1847,8 @@ mod origin_server {
 }
 
 mod metrics {
+    use bytes::Bytes;
+
     use super::*;
 
     struct RejectAll;
@@ -1858,8 +1864,9 @@ mod metrics {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn http_metrics_track_requests() -> Result {
-        let (origin_addr, origin_task) = spawn_origin_server("metrics-origin").await?;
+        let (origin_addr, origin_task) = spawn_origin_server_echo_body("origin").await?;
         let (upstream_router, upstream_id) = spawn_upstream_proxy().await?;
         let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
         let (proxy_addr, _, metrics, proxy_task) =
@@ -1868,29 +1875,51 @@ mod metrics {
             .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).anyerr()?)
             .build()
             .anyerr()?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(1);
+        let body = reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+
+        // we spawn a separate task to ensure active_requests is 1 if the body is not yet terminated.
+        // need to do this in a task to not deadlock, because post.send().await waits for the response.
+        let body_task = tokio::task::spawn({
+            let metrics = metrics.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                tx.send(Ok(Bytes::from("hello"))).await.unwrap();
+                assert_eq!(metrics.active_requests(), 1);
+                drop(tx);
+            }
+        });
         let res = client
-            .get(format!("http://{origin_addr}/metrics"))
+            .post(format!("http://{origin_addr}/upload"))
+            .body(body)
             .send()
             .await
             .anyerr()?;
+        body_task.await.expect("task panicked");
         assert_eq!(res.status(), StatusCode::OK);
         let body = res.bytes().await.anyerr()?;
-        assert_eq!(body.as_ref(), b"metrics-origin GET /metrics");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(body.as_ref(), b"origin POST /upload: hello");
+        assert_eq!(metrics.active_requests(), 0);
         assert_eq!(metrics.requests_accepted.get(), 1);
         assert_eq!(metrics.requests_accepted_h1.get(), 1);
         assert_eq!(metrics.requests_completed.get(), 1);
         assert_eq!(metrics.requests_denied.get(), 0);
-        assert_eq!(metrics.active_requests(), 0);
         assert!(metrics.bytes_to_upstream.get() > 0);
         assert!(metrics.bytes_from_upstream.get() > 0);
+        assert_eq!(metrics.iroh_connections_opened.get(), 1);
+        assert_eq!(metrics.iroh_connections_closed_error.get(), 0);
+        assert_eq!(metrics.iroh_connections_closed_idle.get(), 0);
+        assert_eq!(metrics.active_iroh_connections(), 1);
         drop(origin_task);
         drop(proxy_task);
         upstream_router.shutdown().await.anyerr()?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(metrics.iroh_connections_closed_error.get(), 1);
         Ok(())
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn http_metrics_deny_behavior() -> Result {
         let mode = ProxyMode::Http(HttpProxyOpts::new(RejectAll));
         let (proxy_addr, _, metrics, proxy_task) =

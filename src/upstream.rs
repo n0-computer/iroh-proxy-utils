@@ -27,7 +27,10 @@ use crate::{
         HttpProxyRequestKind, HttpRequest, absolute_target_to_origin_form,
         filter_hop_by_hop_headers,
     },
-    util::{Prebuffered, TrackedRead, TrackedWrite, forward_bidi, recv_to_stream},
+    util::{
+        Prebuffered, StreamEvent, TrackedRead, TrackedStream, TrackedWrite, forward_bidi, nores,
+        recv_to_stream,
+    },
 };
 
 mod auth;
@@ -318,12 +321,15 @@ impl UpstreamProxy {
                     }
                 } else {
                     debug!(%target, "origin request: connecting to origin");
-                    let body = recv_stream_to_body(downstream_recv, {
+                    let body = {
                         let req_metrics = req_metrics.clone();
-                        move |d| {
-                            req_metrics.bytes_to_origin.inc_by(d);
-                        }
-                    });
+                        let body = recv_to_stream(downstream_recv);
+                        let body = TrackedStream::new(body, move |ev| match ev {
+                            StreamEvent::Data(n) => nores(req_metrics.bytes_to_origin.inc_by(n)),
+                            _ => {}
+                        });
+                        reqwest::Body::wrap_stream(body)
+                    };
 
                     // Filter hop-by-hop headers before forwarding to upstream per RFC 9110.
                     let mut headers = req.headers;
@@ -460,14 +466,6 @@ async fn error_response_and_finish(mut send: SendStream) -> Result<(), n0_error:
         .ok();
     send.finish().anyerr()?;
     Ok(())
-}
-
-// Converts a [`Prebuffered`] recv stream into a streaming [`reqwest::Body`].
-fn recv_stream_to_body(
-    recv: Prebuffered<RecvStream>,
-    track_data: impl Fn(u64) + Send + 'static,
-) -> reqwest::Body {
-    reqwest::Body::wrap_stream(recv_to_stream(recv, track_data))
 }
 
 async fn write_response(

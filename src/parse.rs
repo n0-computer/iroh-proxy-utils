@@ -8,7 +8,10 @@ use http::{
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::{downstream::SrcAddr, util::Prebuffered};
+use crate::{
+    downstream::SrcAddr,
+    util::{Prebufferable, Prebuffered},
+};
 
 /// Hop-by-hop headers that MUST NOT be forwarded by proxies per RFC 9110 Section 7.6.1.
 const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
@@ -636,7 +639,7 @@ impl HttpResponse {
     ///
     /// Does not remove the header section from `reader`.
     /// Returns [`io::ErrorKind::OutOfMemory`] if the header section exceeds the buffer limit.
-    pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
+    pub async fn peek(reader: &mut impl Prebufferable) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
             if let Some(response) = Self::parse_with_len(reader.buffer())? {
@@ -654,7 +657,7 @@ impl HttpResponse {
     /// Reads and parses the response status line and header section.
     ///
     /// Removes the header section from the reader.
-    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+    pub async fn read(reader: &mut impl Prebufferable) -> Result<Self> {
         let (len, response) = Self::peek(reader).await?;
         reader.discard(len);
         Ok(response)

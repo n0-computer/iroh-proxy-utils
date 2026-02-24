@@ -33,7 +33,10 @@ pub use self::opts::{
 use crate::{
     ALPN, Authority, HEADER_SECTION_MAX_LENGTH, inc_by_delta,
     parse::{HttpRequest, HttpResponse},
-    util::{Prebuffered, TrackedRead, TrackedWrite, forward_bidi, recv_to_stream},
+    util::{
+        Prebufferable, Prebuffered, StreamEvent, TrackedRead, TrackedStream, TrackedWrite,
+        forward_bidi, nores, recv_to_stream,
+    },
 };
 
 pub(crate) mod metrics;
@@ -208,25 +211,17 @@ impl DownstreamProxy {
                 self.metrics.requests_accepted.inc();
                 self.metrics.requests_accepted_tcp.inc();
                 let (tcp_recv, tcp_send) = stream.split();
-                let TunnelClientStreams {
-                    send: mut upstream_send,
-                    recv: mut upstream_recv,
-                    conn: connection_ref,
-                } = self.create_tunnel(destination).await?;
-                debug!(endpoint_id=%connection_ref.remote_id().fmt_short(), "tunnel established");
+                let mut conn = self.create_tunnel(destination).await?;
+                debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "tunnel established");
                 let metrics = self.metrics.clone();
-                let mut downstream_recv =
+                let mut tcp_recv =
                     TrackedRead::new(tcp_recv, inc_by_delta!(metrics, bytes_to_upstream));
-                let mut downstream_send =
+                let mut tcp_send =
                     TrackedWrite::new(tcp_send, inc_by_delta!(metrics, bytes_from_upstream));
-                let res = forward_bidi(
-                    &mut downstream_recv,
-                    &mut downstream_send,
-                    &mut upstream_recv,
-                    &mut upstream_send,
-                )
-                .await
-                .map_err(ProxyError::io);
+                let res =
+                    forward_bidi(&mut tcp_recv, &mut tcp_send, &mut conn.recv, &mut conn.send)
+                        .await
+                        .map_err(ProxyError::io);
                 match res {
                     Ok(_) => {
                         self.metrics.requests_completed.inc();
@@ -306,7 +301,6 @@ impl DownstreamProxy {
         let mut request = HttpRequest::from_parts(parts);
 
         let metrics = self.metrics.clone();
-        let mut tracker = RequestTracker::new(metrics.clone());
 
         let destination = match opts
             .request_handler
@@ -316,11 +310,11 @@ impl DownstreamProxy {
             Ok(destination) => destination,
             Err(deny) => {
                 metrics.requests_denied.inc();
-                tracker.deny();
                 return Err(ProxyError::from(deny));
             }
         };
 
+        // track metrics.
         metrics.requests_accepted.inc();
         if original_version == Version::HTTP_2 {
             metrics.requests_accepted_h2.inc();
@@ -347,23 +341,21 @@ impl DownstreamProxy {
         debug!(destination=%destination.fmt_short(), ?request, is_connect, is_h2_extended_connect, is_upgrade, "pipe request to upstream");
 
         // Connect to upstream.
-        let TunnelClientStreams {
-            send,
-            mut recv,
-            conn,
-        } = self.connect(destination).await?;
-        debug!(endpoint_id=%conn.remote_id().fmt_short(), "connected to upstream");
+        let conn = self.connect(destination).await?;
+        debug!(endpoint_id=%conn.conn.remote_id().fmt_short(), "connected to upstream");
 
-        let mut send = send;
-        {
-            let mut header_tracker =
-                TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream));
-            request.write(&mut header_tracker).await?;
-            send = header_tracker.into_inner();
-        }
+        let TunnelClientStreams { send, recv, conn } = conn;
+        let conn_guard = Arc::new(conn);
+        let mut upstream_send = TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream))
+            .with_guard(conn_guard.clone());
+        let mut upstream_recv = TrackedRead::new(recv, inc_by_delta!(metrics, bytes_from_upstream))
+            .with_guard(conn_guard.clone());
+
+        // Send request headers.
+        request.write(&mut upstream_send).await?;
 
         let response = if let Some(upgrade_fut) = upgrade {
-            let mut response = read_response(&mut recv).await?;
+            let mut response = read_response(&mut upstream_recv).await?;
             debug!(?response, "read connect response");
 
             if is_h2_extended_connect && response.status == StatusCode::SWITCHING_PROTOCOLS {
@@ -376,70 +368,40 @@ impl DownstreamProxy {
                 || is_upgrade && response.status == StatusCode::SWITCHING_PROTOCOLS;
 
             if is_ok {
-                let streams = TunnelClientStreams { send, recv, conn };
-                let metrics_clone = metrics.clone();
-                spawn(forward_hyper_upgrade(upgrade_fut, streams, metrics_clone));
-                response_to_hyper(response, None, &metrics)?
+                spawn(forward_hyper_upgrade(
+                    upgrade_fut,
+                    upstream_recv,
+                    upstream_send,
+                    metrics.clone(),
+                ));
+                response_to_hyper(response, None, metrics, Some(conn_guard))?
             } else if request.method == Method::CONNECT {
-                response_to_hyper(response, None, &metrics)?
+                response_to_hyper(response, None, metrics, Some(conn_guard))?
             } else {
-                let tracked_send =
-                    TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream));
-                spawn(forward_hyper_body_and_finish(body, tracked_send));
-                response_to_hyper(response, Some(recv), &metrics)?
+                spawn(forward_hyper_body_and_finish(body, upstream_send));
+                // response_to_hyper tracks metrics directly.
+                let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
+                response_to_hyper(response, Some(upstream_recv), metrics, Some(conn_guard))?
             }
         } else {
-            let tracked_send = TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream));
-            spawn(forward_hyper_body_and_finish(body, tracked_send));
-            let response = read_response(&mut recv).await?;
+            spawn(forward_hyper_body_and_finish(body, upstream_send));
+            let response = match read_response(&mut upstream_recv).await {
+                Ok(response) => response,
+                Err(err) => {
+                    metrics.requests_failed.inc();
+                    return Err(err.into());
+                }
+            };
             debug!(
                 status = %response.status,
                 "received response header from upstream"
             );
-            response_to_hyper(response, Some(recv), &metrics)?
+            // response_to_hyper tracks metrics directly.
+            let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
+            response_to_hyper(response, Some(upstream_recv), metrics, Some(conn_guard))?
         };
 
-        tracker.complete();
         Ok(response)
-    }
-}
-
-enum RequestState {
-    Pending,
-    Completed,
-    Denied,
-}
-
-struct RequestTracker {
-    metrics: Arc<DownstreamMetrics>,
-    state: RequestState,
-}
-
-impl RequestTracker {
-    fn new(metrics: Arc<DownstreamMetrics>) -> Self {
-        Self {
-            metrics,
-            state: RequestState::Pending,
-        }
-    }
-
-    fn complete(&mut self) {
-        if matches!(self.state, RequestState::Pending) {
-            self.metrics.requests_completed.inc();
-            self.state = RequestState::Completed;
-        }
-    }
-
-    fn deny(&mut self) {
-        self.state = RequestState::Denied;
-    }
-}
-
-impl Drop for RequestTracker {
-    fn drop(&mut self) {
-        if matches!(self.state, RequestState::Pending) {
-            self.metrics.requests_failed.inc();
-        }
     }
 }
 
@@ -601,19 +563,25 @@ impl ProxyError {
 
 type HyperBody = BoxBody<Bytes, io::Error>;
 
-fn response_to_hyper(
+fn response_to_hyper<G: Unpin + Send + Sync + 'static>(
     response: HttpResponse,
     body: Option<Prebuffered<RecvStream>>,
-    metrics: &Arc<DownstreamMetrics>,
+    metrics: Arc<DownstreamMetrics>,
+    guard: Option<G>,
 ) -> Result<Response<HyperBody>, ProxyError> {
     let mut builder = Response::builder().status(response.status);
     let headers = builder.headers_mut().unwrap();
     *headers = response.headers;
     let body = match body {
-        Some(body) => StreamBody::new(
-            recv_to_stream(body, inc_by_delta!(metrics, bytes_from_upstream)).map_ok(Frame::data),
-        )
-        .boxed(),
+        Some(body) => {
+            let stream = recv_to_stream(body);
+            let stream = TrackedStream::with_guard(stream, guard, move |ev| match ev {
+                StreamEvent::Data(n) => nores(metrics.bytes_from_upstream.inc_by(n)),
+                StreamEvent::Done(Ok(())) => nores(metrics.requests_completed.inc()),
+                StreamEvent::Done(Err(_)) => nores(metrics.requests_failed.inc()),
+            });
+            StreamBody::new(stream.map_ok(Frame::data)).boxed()
+        }
         None => Empty::new().map_err(infallible_to_io).boxed(),
     };
     builder
@@ -621,9 +589,9 @@ fn response_to_hyper(
         .map_err(|err| ProxyError::bad_gateway(anyerr!(err)))
 }
 
-async fn forward_hyper_body_and_finish<F>(
+async fn forward_hyper_body_and_finish<F, G: Unpin>(
     body: Incoming,
-    mut send: TrackedWrite<SendStream, F>,
+    mut send: TrackedWrite<SendStream, F, G>,
 ) -> Result<()>
 where
     F: Fn(u64) + Unpin + Send + 'static,
@@ -651,38 +619,31 @@ async fn forward_hyper_body(
 
 async fn forward_hyper_upgrade(
     upgrade_fut: hyper::upgrade::OnUpgrade,
-    conn: TunnelClientStreams,
+    mut upstream_recv: impl AsyncRead + Send + Unpin,
+    mut upstream_send: impl AsyncWrite + Send + Unpin,
     metrics: Arc<DownstreamMetrics>,
 ) -> Result<()> {
     let upgraded = upgrade_fut.await.std_context("HTTP/1 upgrade failed")?;
     let upgraded = TokioIo::new(upgraded);
     // Split the upgraded connection for bidirectional copy
     let (client_read, client_write) = tokio::io::split(upgraded);
-    let TunnelClientStreams {
-        send: mut upstream_send,
-        recv: mut upstream_recv,
-        conn: conn_ref,
-    } = conn;
 
-    let mut downstream_read =
-        TrackedRead::new(client_read, inc_by_delta!(metrics, bytes_to_upstream));
-    let mut downstream_write = TrackedWrite::new(client_write, {
+    let mut client_read = TrackedRead::new(client_read, inc_by_delta!(metrics, bytes_to_upstream));
+    let mut client_write = TrackedWrite::new(client_write, {
         inc_by_delta!(metrics, bytes_from_upstream)
     });
 
     forward_bidi(
-        &mut downstream_read,
-        &mut downstream_write,
+        &mut client_read,
+        &mut client_write,
         &mut upstream_recv,
         &mut upstream_send,
     )
     .await?;
-
-    drop(conn_ref);
     Ok(())
 }
 
-async fn read_response(recv: &mut Prebuffered<RecvStream>) -> Result<HttpResponse, ProxyError> {
+async fn read_response(recv: &mut impl Prebufferable) -> Result<HttpResponse, ProxyError> {
     HttpResponse::read(recv)
         .await
         .map_err(ProxyError::bad_gateway)
