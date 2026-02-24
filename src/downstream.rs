@@ -339,6 +339,8 @@ impl DownstreamProxy {
 
         // We always forward as HTTP/1.1.
         request.version = Version::HTTP_11;
+        // Now we shouldn't mutate the request anymore.
+        let request = request;
 
         debug!(destination=%destination.fmt_short(), ?request, is_connect, is_h2_extended_connect, is_upgrade, "pipe request to upstream");
 
@@ -346,24 +348,33 @@ impl DownstreamProxy {
         let (conn, send, recv) = self.connect(destination).await?;
         debug!(endpoint_id=%conn.remote_id().fmt_short(), "connected to upstream");
 
+        // We need to keep `conn` alive until the request is fully processed in both directions.
+        // `conn` is a `ConnectionRef` guard handed out from the connection pool. Once it is dropped,
+        // the connection is marked as idle, and will be closed after the idle timeout.
         let conn_guard = Arc::new(conn);
+
+        // We want to track bytes written to/from upstream. And we store the `conn_guard` into the streams.
+        // Once both streams are dropped, the request is fully done, and we can drop the conn ref safely.
         let mut upstream_send = TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream))
             .with_guard(conn_guard.clone());
-        let upstream_recv = TrackedRead::new(recv, {
-            let metrics = metrics.clone();
-            move |d| {
-                metrics.bytes_from_upstream.inc_by(d);
-            }
-        })
-        // let mut upstream_recv = TrackedRead::new(recv, inc_by_delta!(metrics, bytes_from_upstream))
-        .with_guard(conn_guard.clone());
+        let upstream_recv = TrackedRead::new(recv, inc_by_delta!(metrics, bytes_from_upstream))
+            .with_guard(conn_guard.clone());
+        // We need to prebuffer for reading the response before passing it on.
         let mut upstream_recv = Prebuffered::new(upstream_recv, HEADER_SECTION_MAX_LENGTH);
 
         // Send request headers.
         request.write(&mut upstream_send).await?;
 
         let response = if let Some(upgrade_fut) = upgrade {
-            let mut response = read_response(&mut upstream_recv).await?;
+            // For upgrade requests: First read the response to see if the upgrade was accepted.
+            // Only then forward the request body as upgrade stream.
+            let mut response = match read_response(&mut upstream_recv).await {
+                Ok(response) => response,
+                Err(err) => {
+                    metrics.requests_failed.inc();
+                    return Err(err.into());
+                }
+            };
             debug!(?response, "read connect response");
 
             if is_h2_extended_connect && response.status == StatusCode::SWITCHING_PROTOCOLS {
@@ -386,11 +397,10 @@ impl DownstreamProxy {
                 response_to_hyper::<tokio::io::Empty>(response, None, metrics)?
             } else {
                 spawn(forward_hyper_body_and_finish(body, upstream_send));
-                // // response_to_hyper tracks metrics directly.
-                // let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
                 response_to_hyper(response, Some(upstream_recv), metrics)?
             }
         } else {
+            // For non-upgrade requests: Forward the body and read the response concurrently.
             spawn(forward_hyper_body_and_finish(body, upstream_send));
             let response = match read_response(&mut upstream_recv).await {
                 Ok(response) => response,
@@ -403,8 +413,6 @@ impl DownstreamProxy {
                 status = %response.status,
                 "received response header from upstream"
             );
-            // // response_to_hyper tracks metrics directly.
-            // let (upstream_recv, _metrics_inc) = upstream_recv.into_parts();
             response_to_hyper(response, Some(upstream_recv), metrics)?
         };
 
@@ -584,16 +592,10 @@ where
     let body = match body {
         Some(body) => {
             let stream = ReaderStream::new(body);
-            // let stream = recv_to_stream(body);
-            // let stream = TrackedStream::with_guard(stream, guard, move |ev| match ev {
-            //     StreamEvent::Data(_n) => {}
-            //     StreamEvent::Done(Ok(())) => nores(metrics.requests_completed.inc()),
-            //     StreamEvent::Done(Err(_)) => nores(metrics.requests_failed.inc()),
-            // });
             let stream = TrackedStream::new(stream, move |ev| match ev {
-                StreamEvent::Data(_n) => {}
                 StreamEvent::Done(Ok(())) => nores(metrics.requests_completed.inc()),
                 StreamEvent::Done(Err(_)) => nores(metrics.requests_failed.inc()),
+                _ => {}
             });
             StreamBody::new(stream.map_ok(Frame::data)).boxed()
         }
