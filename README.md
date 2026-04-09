@@ -2,8 +2,8 @@
 
 ![CI](https://github.com/n0-computer/iroh-proxy-utils/actions/workflows/ci.yml/badge.svg)
 [![Crates.io](https://img.shields.io/crates/v/iroh-proxy-utils.svg)](https://crates.io/crates/iroh-proxy-utils)
-[![Documentation](https://docs.rs/iroh-proxy-utils/badge.svg)](https://docs.rs/redb)
-[![License](https://img.shields.io/crates/l/iroh-proxy-utils)](https://crates.io/crates/redb)
+[![docs.rs](https://img.shields.io/docsrs/iroh-proxy-utils)](https://docs.rs/iroh-proxy-utils)
+[![License](https://img.shields.io/crates/l/iroh-proxy-utils)](https://crates.io/crates/iroh-proxy-utils)
 
 Primitives for TCP and HTTP proxying over [iroh](https://github.com/n0-computer/iroh) connections.
 

@@ -2,6 +2,14 @@
 name = "iroh-proxy-utils"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP and TCP proxy utilities for iroh peer-to-peer connections"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/n0-computer/iroh-proxy-utils"
+authors = ["n0 team"]
+documentation = "https://docs.rs/iroh-proxy-utils"
+keywords = ["iroh", "proxy", "http", "quic", "p2p"]
+categories = ["network-programming"]
+rust-version = "1.85"
 
 [dependencies]
 bytes = "1.11.0"
