@@ -8,7 +8,10 @@ use http::{
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::{downstream::SrcAddr, util::Prebuffered};
+use crate::{
+    downstream::SrcAddr,
+    util::{Prebufferable, Prebuffered},
+};
 
 /// Hop-by-hop headers that MUST NOT be forwarded by proxies per RFC 9110 Section 7.6.1.
 const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
@@ -65,7 +68,7 @@ pub fn filter_hop_by_hop_headers(headers: &mut HeaderMap<HeaderValue>) {
 ///
 /// Represents the authority component of a URI, containing the host (domain name
 /// or IP address) and port number. Used for routing proxy requests to origin servers.
-#[derive(Debug, Clone, derive_more::Display)]
+#[derive(Debug, Clone, derive_more::Display, Ord, PartialOrd, Hash, Eq, PartialEq)]
 #[display("{host}:{port}")]
 pub struct Authority {
     /// Hostname or IP literal (without brackets for IPv6).
@@ -155,6 +158,13 @@ impl Authority {
         let port = &self.port;
         format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n")
     }
+}
+
+/// Converts an absolute-form request target to origin-form (path and optional query only).
+/// Per RFC 9110, requests to an origin server use origin-form.
+pub(crate) fn absolute_target_to_origin_form(target: &Uri) -> Result<Uri> {
+    let path_and_query = target.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    Uri::from_str(path_and_query).std_context("invalid path_and_query")
 }
 
 /// Parsed HTTP request with method, URI, headers, and version.
@@ -273,9 +283,8 @@ impl HttpRequest {
                 if self.uri.scheme().is_none() || self.uri.authority().is_none() {
                     return Err(anyerr!("Missing absolute-form request target"));
                 }
-                let target = self.uri.to_string();
                 HttpProxyRequestKind::Absolute {
-                    target,
+                    target: self.uri.clone(),
                     method: self.method,
                 }
             }
@@ -468,7 +477,7 @@ pub enum HttpRequestKind {
 ///
 /// Distinguishes between CONNECT tunneling and absolute-form forwarding,
 /// both of which are valid for forward proxies.
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub enum HttpProxyRequestKind {
     /// CONNECT tunnel request with authority-form target.
     Tunnel {
@@ -478,10 +487,25 @@ pub enum HttpProxyRequestKind {
     /// Forward proxy request with absolute-form target.
     Absolute {
         /// The full target URL.
-        target: String,
+        target: Uri,
         /// The HTTP method.
         method: Method,
     },
+}
+
+impl HttpProxyRequestKind {
+    /// Returns a [`ProxyTargetId`] for this request.
+    ///
+    /// Returns an error if the absolute-form URI does not contain a port and does not have an HTTP(s) scheme.
+    pub fn authority(&self) -> Result<Authority> {
+        match self {
+            HttpProxyRequestKind::Tunnel { target } => Ok(target.clone()),
+            HttpProxyRequestKind::Absolute { target, .. } => {
+                let target = Authority::from_absolute_uri(&target)?;
+                Ok(target)
+            }
+        }
+    }
 }
 
 /// HTTP request suitable for proxy routing decisions.
@@ -615,7 +639,7 @@ impl HttpResponse {
     ///
     /// Does not remove the header section from `reader`.
     /// Returns [`io::ErrorKind::OutOfMemory`] if the header section exceeds the buffer limit.
-    pub async fn peek(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<(usize, Self)> {
+    pub async fn peek(reader: &mut impl Prebufferable) -> Result<(usize, Self)> {
         while !reader.is_full() {
             reader.buffer_more().await?;
             if let Some(response) = Self::parse_with_len(reader.buffer())? {
@@ -633,7 +657,7 @@ impl HttpResponse {
     /// Reads and parses the response status line and header section.
     ///
     /// Removes the header section from the reader.
-    pub async fn read(reader: &mut Prebuffered<impl AsyncRead + Unpin>) -> Result<Self> {
+    pub async fn read(reader: &mut impl Prebufferable) -> Result<Self> {
         let (len, response) = Self::peek(reader).await?;
         reader.discard(len);
         Ok(response)

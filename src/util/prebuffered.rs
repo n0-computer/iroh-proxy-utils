@@ -25,6 +25,36 @@ pub struct Prebuffered<R> {
     max_len: usize,
 }
 
+pub trait Prebufferable: Send + Unpin {
+    fn is_full(&self) -> bool;
+    /// Returns the unconsumed buffered bytes.
+    fn buffer(&self) -> &[u8];
+
+    /// Discards `n` bytes from the front of the buffer.
+    fn discard(&mut self, n: usize);
+
+    /// Buffers more data from the inner reader.
+    fn buffer_more(&mut self) -> impl Future<Output = io::Result<usize>> + Send;
+}
+
+impl<R: AsyncRead + Unpin + Send> Prebufferable for Prebuffered<R> {
+    fn is_full(&self) -> bool {
+        Prebuffered::is_full(self)
+    }
+
+    fn buffer(&self) -> &[u8] {
+        Prebuffered::buffer(self)
+    }
+
+    fn discard(&mut self, n: usize) {
+        Prebuffered::discard(self, n)
+    }
+
+    fn buffer_more(&mut self) -> impl Future<Output = io::Result<usize>> + Send {
+        Prebuffered::buffer_more(self)
+    }
+}
+
 impl<R: AsyncRead + Unpin> Prebuffered<R> {
     /// Creates a new `Prebuffered` wrapper.
     pub(crate) fn new(inner: R, max_len: usize) -> Self {
