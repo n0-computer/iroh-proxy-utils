@@ -274,6 +274,8 @@ impl<W: AsyncWrite + Unpin, F: Fn(u64) + Unpin, G: Unpin> AsyncWrite for Tracked
     }
 }
 
+/// Not part of the public API.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! inc_by_delta {
     ($metrics:ident, $field:tt) => {{

@@ -10,7 +10,7 @@ use crate::Authority;
 /// Aggregate metrics for an [`super::UpstreamProxy`] instance.
 ///
 /// Tracks connection and request counts across all targets, and provides
-/// access to per-target metrics via [`Metrics::get`] and [`Metrics::for_each`].
+/// access to per-target metrics via [`UpstreamMetrics::get`] and [`UpstreamMetrics::for_each`].
 #[derive(Debug, Default)]
 pub struct UpstreamMetrics {
     targets: RwLock<BTreeMap<Authority, Arc<TargetMetrics>>>,

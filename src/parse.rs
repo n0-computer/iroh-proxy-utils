@@ -126,7 +126,7 @@ impl Authority {
             None => match uri.scheme() {
                 Some(scheme) if *scheme == Scheme::HTTP => 80,
                 Some(scheme) if *scheme == Scheme::HTTPS => 443,
-                _ => Err(anyerr!("Expected URI to with port or http(s) scheme"))?,
+                _ => Err(anyerr!("Expected URI with port or http(s) scheme"))?,
             },
         };
         Ok(Self {
@@ -494,7 +494,7 @@ pub enum HttpProxyRequestKind {
 }
 
 impl HttpProxyRequestKind {
-    /// Returns a [`ProxyTargetId`] for this request.
+    /// Returns the [`Authority`] for this request.
     ///
     /// Returns an error if the absolute-form URI does not contain a port and does not have an HTTP(s) scheme.
     pub fn authority(&self) -> Result<Authority> {
