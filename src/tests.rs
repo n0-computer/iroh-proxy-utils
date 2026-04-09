@@ -38,7 +38,7 @@ use crate::{
 async fn bind_endpoint() -> Result<Endpoint, BindError> {
     static ADDRESS_LOOKUP: OnceLock<MemoryLookup> = OnceLock::new();
     let address_lookup = ADDRESS_LOOKUP.get_or_init(MemoryLookup::default);
-    let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
+    let endpoint = Endpoint::empty_builder()
         .address_lookup(address_lookup.clone())
         .bind()
         .await?;
