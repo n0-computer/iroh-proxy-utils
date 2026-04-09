@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::Parser;
-use iroh::{Endpoint, EndpointId, protocol::Router};
+use iroh::{Endpoint, EndpointId, endpoint::presets, protocol::Router};
 use iroh_proxy_utils::{
     ALPN, Authority, HttpRequest, IROH_DESTINATION_HEADER,
     downstream::{
@@ -224,7 +224,7 @@ async fn origin_server(listener: TcpListener) -> Result<()> {
 // -- Upstream --
 
 async fn cmd_upstream() -> Result<()> {
-    let endpoint = Endpoint::builder().bind().await?;
+    let endpoint = Endpoint::bind(presets::N0).await?;
     let endpoint_id = endpoint.id();
     let router = Router::builder(endpoint)
         .accept(ALPN, UpstreamProxy::new(AcceptAll)?)
@@ -238,7 +238,7 @@ async fn cmd_upstream() -> Result<()> {
 // -- Reverse proxy --
 
 async fn cmd_reverse_proxy(port: u16, upstream: EndpointId, origin: String) -> Result<()> {
-    let endpoint = Endpoint::builder().bind().await?;
+    let endpoint = Endpoint::bind(presets::N0).await?;
     let proxy = DownstreamProxy::new(endpoint, Default::default());
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     let addr = listener.local_addr()?;
@@ -279,7 +279,7 @@ impl RequestHandler for HeaderResolver {
 }
 
 async fn cmd_forward_proxy(port: u16) -> Result<()> {
-    let endpoint = Endpoint::builder().bind().await?;
+    let endpoint = Endpoint::bind(presets::N0).await?;
     let proxy = DownstreamProxy::new(endpoint, Default::default());
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     let addr = listener.local_addr()?;
@@ -321,7 +321,7 @@ async fn spawn_bench_server(
     println!("origin listening on {origin_addr}");
 
     // 2. Upstream proxy (iroh endpoint with AcceptAll)
-    let upstream_endpoint = Endpoint::builder().bind().await?;
+    let upstream_endpoint = Endpoint::bind(presets::N0).await?;
     let upstream_id = upstream_endpoint.id();
     let router = Router::builder(upstream_endpoint)
         .accept(ALPN, UpstreamProxy::new(AcceptAll)?)
@@ -330,7 +330,7 @@ async fn spawn_bench_server(
     println!("upstream endpoint: {upstream_id}");
 
     // 3. Forward proxy with ForwardProxyMode::Static
-    let forward_endpoint = Endpoint::builder().bind().await?;
+    let forward_endpoint = Endpoint::bind(presets::N0).await?;
     let forward_proxy = DownstreamProxy::new(forward_endpoint.clone(), Default::default());
     let forward_listener = TcpListener::bind(format!("127.0.0.1:{forward_port}")).await?;
     let forward_addr = forward_listener.local_addr()?;
