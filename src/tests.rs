@@ -9,7 +9,10 @@ use std::{
 use http::StatusCode;
 use hyper_util::rt::TokioExecutor;
 use iroh::{
-    Endpoint, EndpointId, address_lookup::MemoryLookup, endpoint::BindError, protocol::Router,
+    Endpoint, EndpointId,
+    address_lookup::MemoryLookup,
+    endpoint::{BindError, presets},
+    protocol::Router,
 };
 use n0_error::{AnyError, Result, StdResultExt, stack_error};
 use n0_future::task::AbortOnDropHandle;
@@ -38,7 +41,7 @@ use crate::{
 async fn bind_endpoint() -> Result<Endpoint, BindError> {
     static ADDRESS_LOOKUP: OnceLock<MemoryLookup> = OnceLock::new();
     let address_lookup = ADDRESS_LOOKUP.get_or_init(MemoryLookup::default);
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::Minimal)
         .address_lookup(address_lookup.clone())
         .bind()
         .await?;
