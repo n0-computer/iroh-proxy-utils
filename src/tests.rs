@@ -127,6 +127,15 @@ async fn spawn_origin_server_echo_body(
     Ok((tcp_addr, AbortOnDropHandle::new(task)))
 }
 
+/// Spawns a simple HTTP origin server that streams a large response body slowly.
+async fn spawn_origin_server_streaming_body() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
+    let listener = TcpListener::bind("localhost:0").await?;
+    let tcp_addr = listener.local_addr()?;
+    debug!(%tcp_addr, "spawned streaming origin server");
+    let task = tokio::spawn(async move { origin_server::run_streaming_body(listener).await });
+    Ok((tcp_addr, AbortOnDropHandle::new(task)))
+}
+
 /// Spawns a simple TCP echo server.
 async fn spawn_echo_server() -> Result<(SocketAddr, AbortOnDropHandle<()>)> {
     let listener = TcpListener::bind("localhost:0").await?;
@@ -1692,14 +1701,20 @@ async fn test_uds_http2_reverse() -> Result<()> {
 }
 
 mod origin_server {
-    use std::{convert::Infallible, sync::Arc};
+    use std::{convert::Infallible, sync::Arc, time::Duration};
 
     use fastwebsockets::{FragmentCollector, Frame, OpCode, Payload, WebSocketError};
     use http::HeaderValue;
-    use http_body_util::{BodyExt, Empty, Full};
-    use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
+    use http_body_util::{BodyExt, Empty, Full, StreamBody};
+    use hyper::{
+        Request, Response,
+        body::{Bytes, Frame as BodyFrame},
+        server::conn::http1,
+        service::service_fn,
+    };
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener;
+    use tokio_stream::wrappers::ReceiverStream;
     use tracing::debug;
 
     /// Returns "{label} {METHOD} {PATH}" as response body.
@@ -1754,6 +1769,42 @@ mod origin_server {
                         let response = format!("{} {} {}: {}", *label, method, path, body_str);
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(response))))
                     }
+                };
+                let _ = http1::Builder::new()
+                    .serve_connection(io, service_fn(handler))
+                    .await;
+            });
+        }
+    }
+
+    /// Streams a large response body slowly so tests can disconnect mid-response.
+    pub(super) async fn run_streaming_body(listener: TcpListener) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let io = TokioIo::new(stream);
+            tokio::task::spawn(async move {
+                let handler = move |_req: Request<hyper::body::Incoming>| async move {
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<BodyFrame<Bytes>, Infallible>>(1);
+                    tokio::spawn(async move {
+                        for _ in 0..64 {
+                            let frame = BodyFrame::data(Bytes::from(vec![b'x'; 16 * 1024]));
+                            if tx.send(Ok(frame)).await.is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    });
+
+                    let body = StreamBody::new(ReceiverStream::new(rx)).boxed();
+                    let mut res = Response::new(body);
+                    res.headers_mut().insert(
+                        http::header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&(64 * 16 * 1024).to_string()).unwrap(),
+                    );
+                    Ok::<_, Infallible>(res)
                 };
                 let _ = http1::Builder::new()
                     .serve_connection(io, service_fn(handler))
@@ -1903,6 +1954,7 @@ mod metrics {
         assert_eq!(downstream_metrics.requests_accepted.get(), 1);
         assert_eq!(downstream_metrics.requests_accepted_h1.get(), 1);
         assert_eq!(downstream_metrics.requests_completed.get(), 1);
+        assert_eq!(downstream_metrics.client_disconnect_count.get(), 0);
         assert_eq!(downstream_metrics.requests_denied.get(), 0);
         assert!(downstream_metrics.bytes_to_upstream.get() > 0);
         assert!(downstream_metrics.bytes_from_upstream.get() > 0);
@@ -1935,6 +1987,60 @@ mod metrics {
 
     #[tokio::test]
     #[traced_test]
+    async fn http_metrics_do_not_complete_when_client_drops_response_body() -> Result {
+        let (origin_addr, origin_task) = spawn_origin_server_streaming_body().await?;
+        let (upstream_router, upstream_id, _upstream_metrics) =
+            spawn_upstream_proxy_with_metrics().await?;
+        let mode = ProxyMode::Http(HttpProxyOpts::new(StaticForwardProxy(upstream_id)));
+        let (proxy_addr, _, downstream_metrics, proxy_task) =
+            spawn_downstream_proxy_with_metrics(mode).await?;
+
+        let mut stream = TcpStream::connect(proxy_addr).await?;
+        let req = format!(
+            "GET http://{origin_addr}/stream HTTP/1.1\r\n\
+             Host: {origin_addr}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await?;
+
+        let mut response_buf = vec![0u8; 4096];
+        let bytes_read = stream.read(&mut response_buf).await?;
+        assert!(bytes_read > 0);
+        drop(stream);
+
+        for _ in 0..100 {
+            if downstream_metrics.active_requests() == 0
+                && downstream_metrics.requests_accepted.get() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(downstream_metrics.requests_accepted.get(), 1);
+        assert_eq!(downstream_metrics.active_requests(), 0);
+        assert_eq!(downstream_metrics.requests_completed.get(), 0);
+        assert_eq!(downstream_metrics.requests_failed.get(), 0);
+        assert_eq!(downstream_metrics.client_disconnect_count.get(), 1);
+        assert_eq!(
+            downstream_metrics.client_disconnect_upstream_bytes.get(),
+            downstream_metrics.bytes_to_upstream.get()
+        );
+        assert_eq!(
+            downstream_metrics.client_disconnect_downstream_bytes.get(),
+            downstream_metrics.bytes_from_upstream.get()
+        );
+        assert!(downstream_metrics.client_disconnect_upstream_bytes.get() > 0);
+        assert!(downstream_metrics.client_disconnect_downstream_bytes.get() > 0);
+
+        drop(origin_task);
+        drop(proxy_task);
+        upstream_router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn http_metrics_deny_behavior() -> Result {
         let mode = ProxyMode::Http(HttpProxyOpts::new(RejectAll));
         let (proxy_addr, _, metrics, proxy_task) =
@@ -1953,6 +2059,7 @@ mod metrics {
         assert_eq!(metrics.requests_denied.get(), 1);
         assert_eq!(metrics.requests_completed.get(), 0);
         assert_eq!(metrics.requests_failed.get(), 0);
+        assert_eq!(metrics.client_disconnect_count.get(), 0);
         assert_eq!(metrics.active_requests(), 0);
 
         drop(proxy_task);

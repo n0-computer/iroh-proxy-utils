@@ -82,6 +82,7 @@ where
 pub enum StreamEvent<'a> {
     Data(u64),
     Done(Result<(), &'a io::Error>),
+    DroppedBeforeDone,
 }
 
 impl<S, F> TrackedStream<S, F>
@@ -104,7 +105,7 @@ where
 {
     fn drop(self: Pin<&mut Self>) {
         if let Some(f) = self.project().on_event.take() {
-            f(StreamEvent::Done(Ok(())));
+            f(StreamEvent::DroppedBeforeDone);
         }
     }
 }

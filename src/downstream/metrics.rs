@@ -30,6 +30,8 @@ pub struct DownstreamMetrics {
     pub requests_completed: Counter,
     /// Requests that failed after being accepted (upstream or network error).
     pub requests_failed: Counter,
+    /// Requests whose downstream client stopped reading before the upstream response body finished.
+    pub client_disconnect_count: Counter,
 
     /// Number of QUIC connections opened toward upstream iroh nodes.
     pub iroh_connections_opened: Counter,
@@ -42,6 +44,10 @@ pub struct DownstreamMetrics {
     pub bytes_to_upstream: Counter,
     /// Bytes read from the upstream proxy (upstream ➜ downstream).
     pub bytes_from_upstream: Counter,
+    /// Bytes written to the upstream proxy before downstream client disconnects.
+    pub client_disconnect_upstream_bytes: Counter,
+    /// Bytes read from the upstream proxy before downstream client disconnects.
+    pub client_disconnect_downstream_bytes: Counter,
 }
 
 impl DownstreamMetrics {
@@ -53,6 +59,7 @@ impl DownstreamMetrics {
             .get()
             .saturating_sub(self.requests_completed.get())
             .saturating_sub(self.requests_failed.get())
+            .saturating_sub(self.client_disconnect_count.get())
     }
 
     /// Returns the total number of opened QUIC connections.

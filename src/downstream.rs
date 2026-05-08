@@ -1,4 +1,13 @@
-use std::{convert::Infallible, fmt::Debug, io, net::SocketAddr, sync::Arc};
+use std::{
+    convert::Infallible,
+    fmt::Debug,
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 use bytes::Bytes;
 use http::{Method, StatusCode, Version, header};
@@ -35,7 +44,7 @@ use crate::{
     parse::{HttpRequest, HttpResponse},
     util::{
         Prebufferable, Prebuffered, StreamEvent, TrackedRead, TrackedStream, TrackedWrite,
-        forward_bidi, nores,
+        forward_bidi,
     },
 };
 
@@ -352,13 +361,32 @@ impl DownstreamProxy {
         // `conn` is a `ConnectionRef` guard handed out from the connection pool. Once it is dropped,
         // the connection is marked as idle, and will be closed after the idle timeout.
         let conn_guard = Arc::new(conn);
+        let request_bytes = Arc::new(RequestByteCounts::default());
 
         // We want to track bytes written to/from upstream. And we store the `conn_guard` into the streams.
         // Once both streams are dropped, the request is fully done, and we can drop the conn ref safely.
-        let mut upstream_send = TrackedWrite::new(send, inc_by_delta!(metrics, bytes_to_upstream))
-            .with_guard(conn_guard.clone());
-        let upstream_recv = TrackedRead::new(recv, inc_by_delta!(metrics, bytes_from_upstream))
-            .with_guard(conn_guard.clone());
+        let mut upstream_send = {
+            let metrics = metrics.clone();
+            let request_bytes = request_bytes.clone();
+            TrackedWrite::new(send, move |d| {
+                metrics.bytes_to_upstream.inc_by(d);
+                request_bytes
+                    .bytes_to_upstream
+                    .fetch_add(d, Ordering::Relaxed);
+            })
+            .with_guard(conn_guard.clone())
+        };
+        let upstream_recv = {
+            let metrics = metrics.clone();
+            let request_bytes = request_bytes.clone();
+            TrackedRead::new(recv, move |d| {
+                metrics.bytes_from_upstream.inc_by(d);
+                request_bytes
+                    .bytes_from_upstream
+                    .fetch_add(d, Ordering::Relaxed);
+            })
+            .with_guard(conn_guard.clone())
+        };
         // We need to prebuffer for reading the response before passing it on.
         let mut upstream_recv = Prebuffered::new(upstream_recv, HEADER_SECTION_MAX_LENGTH);
 
@@ -392,12 +420,12 @@ impl DownstreamProxy {
                     upstream_recv,
                     upstream_send,
                 ));
-                response_to_hyper::<tokio::io::Empty>(response, None, metrics)?
+                response_to_hyper::<tokio::io::Empty>(response, None, metrics, request_bytes)?
             } else if request.method == Method::CONNECT {
-                response_to_hyper::<tokio::io::Empty>(response, None, metrics)?
+                response_to_hyper::<tokio::io::Empty>(response, None, metrics, request_bytes)?
             } else {
                 spawn(forward_hyper_body_and_finish(body, upstream_send));
-                response_to_hyper(response, Some(upstream_recv), metrics)?
+                response_to_hyper(response, Some(upstream_recv), metrics, request_bytes)?
             }
         } else {
             // For non-upgrade requests: Forward the body and read the response concurrently.
@@ -413,7 +441,7 @@ impl DownstreamProxy {
                 status = %response.status,
                 "received response header from upstream"
             );
-            response_to_hyper(response, Some(upstream_recv), metrics)?
+            response_to_hyper(response, Some(upstream_recv), metrics, request_bytes)?
         };
 
         Ok(response)
@@ -578,10 +606,87 @@ impl ProxyError {
 
 type HyperBody = BoxBody<Bytes, io::Error>;
 
+#[derive(Debug, Default)]
+struct RequestByteCounts {
+    bytes_to_upstream: AtomicU64,
+    bytes_from_upstream: AtomicU64,
+}
+
+impl RequestByteCounts {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.bytes_to_upstream.load(Ordering::Relaxed),
+            self.bytes_from_upstream.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ResponseBodyMetrics {
+    metrics: Arc<DownstreamMetrics>,
+    request_bytes: Arc<RequestByteCounts>,
+    content_length: Option<u64>,
+    body_bytes: AtomicU64,
+    finished: AtomicBool,
+}
+
+impl ResponseBodyMetrics {
+    fn new(
+        metrics: Arc<DownstreamMetrics>,
+        request_bytes: Arc<RequestByteCounts>,
+        content_length: Option<u64>,
+    ) -> Self {
+        Self {
+            metrics,
+            request_bytes,
+            content_length,
+            body_bytes: AtomicU64::new(0),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    fn record_body_bytes(&self, bytes: u64) {
+        let Some(content_length) = self.content_length else {
+            return;
+        };
+        let body_bytes = self.body_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if body_bytes >= content_length {
+            self.mark_completed();
+        }
+    }
+
+    fn mark_completed(&self) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.metrics.requests_completed.inc();
+        }
+    }
+
+    fn mark_failed(&self) {
+        if !self.finished.swap(true, Ordering::Relaxed) {
+            self.metrics.requests_failed.inc();
+        }
+    }
+
+    fn mark_client_disconnect(&self) {
+        if self.finished.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (bytes_to_upstream, bytes_from_upstream) = self.request_bytes.snapshot();
+        self.metrics.client_disconnect_count.inc();
+        self.metrics
+            .client_disconnect_upstream_bytes
+            .inc_by(bytes_to_upstream);
+        self.metrics
+            .client_disconnect_downstream_bytes
+            .inc_by(bytes_from_upstream);
+    }
+}
+
 fn response_to_hyper<R>(
     response: HttpResponse,
     body: Option<R>,
     metrics: Arc<DownstreamMetrics>,
+    request_bytes: Arc<RequestByteCounts>,
 ) -> Result<Response<HyperBody>, ProxyError>
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -589,13 +694,23 @@ where
     let mut builder = Response::builder().status(response.status);
     let headers = builder.headers_mut().unwrap();
     *headers = response.headers;
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
     let body = match body {
         Some(body) => {
+            let response_metrics = Arc::new(ResponseBodyMetrics::new(
+                metrics,
+                request_bytes,
+                content_length,
+            ));
             let stream = ReaderStream::new(body);
             let stream = TrackedStream::new(stream, move |ev| match ev {
-                StreamEvent::Done(Ok(())) => nores(metrics.requests_completed.inc()),
-                StreamEvent::Done(Err(_)) => nores(metrics.requests_failed.inc()),
-                _ => {}
+                StreamEvent::Data(bytes) => response_metrics.record_body_bytes(bytes),
+                StreamEvent::Done(Ok(())) => response_metrics.mark_completed(),
+                StreamEvent::Done(Err(_)) => response_metrics.mark_failed(),
+                StreamEvent::DroppedBeforeDone => response_metrics.mark_client_disconnect(),
             });
             StreamBody::new(stream.map_ok(Frame::data)).boxed()
         }
