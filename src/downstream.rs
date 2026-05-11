@@ -16,7 +16,7 @@ use iroh::{
     Endpoint, EndpointId,
     endpoint::{ConnectionError, RecvStream, SendStream},
 };
-use iroh_blobs::util::connection_pool::{self, ConnectionPool, ConnectionRef};
+use iroh_util::connection_pool::{self, ConnectionPool, ConnectionRef};
 use n0_error::{AnyError, Result, StdResultExt, anyerr, stack_error};
 use n0_future::TryStreamExt;
 use tokio::{
