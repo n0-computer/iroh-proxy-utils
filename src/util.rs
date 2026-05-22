@@ -60,7 +60,7 @@ pub(crate) fn recv_to_stream(
                 Ok(None) => {
                     return None;
                 }
-                Ok(Some(chunk)) => Ok(chunk.bytes),
+                Ok(Some(chunk)) => Ok(chunk),
             }
         };
         Some((item, (None, recv)))

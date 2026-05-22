@@ -4,7 +4,7 @@ use dynosaur::dynosaur;
 use http::{HeaderValue, Method, StatusCode, header::InvalidHeaderValue};
 use http_body_util::BodyExt;
 use iroh::EndpointId;
-use iroh_blobs::util::connection_pool;
+use iroh_util::connection_pool;
 use n0_error::{AnyError, Result};
 
 use crate::{
