@@ -1,6 +1,17 @@
 # Changelog
 
-## [0.2.0](https://github.com/n0-computer/iroh-proxy-utils/compare/v0.1.0..0.2.0) - 2026-04-21
+## [0.3.0](https://github.com/n0-computer/iroh-proxy-utils/compare/v0.2.0..0.3.0) - 2026-06-15
+
+### Deps
+
+- Update to iroh 1.0-rc.0 ([#22](https://github.com/n0-computer/iroh-proxy-utils/issues/22)) - ([52baa21](https://github.com/n0-computer/iroh-proxy-utils/commit/52baa2130a1f705bccc16092732a0e12551d94ad))
+- Update to iroh 1.0 ([#23](https://github.com/n0-computer/iroh-proxy-utils/issues/23)) - ([b314397](https://github.com/n0-computer/iroh-proxy-utils/commit/b3143979a94d04910b436bf809e6b3df22f93338))
+
+## [0.2.0](https://github.com/n0-computer/iroh-proxy-utils/compare/v0.1.0..v0.2.0) - 2026-04-21
+
+### ⚙️ Miscellaneous Tasks
+
+- Prepare 0.2.0 release ([#20](https://github.com/n0-computer/iroh-proxy-utils/issues/20)) - ([ef27ee8](https://github.com/n0-computer/iroh-proxy-utils/commit/ef27ee886977f809ae7a3414a3f5ca4f8628ad85))
 
 ### Deps
 

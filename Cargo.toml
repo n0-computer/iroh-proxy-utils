@@ -1,6 +1,6 @@
 [package]
 name = "iroh-proxy-utils"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "HTTP and TCP proxy utilities for iroh peer-to-peer connections"
 license = "MIT OR Apache-2.0"
